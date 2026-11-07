@@ -1,0 +1,26 @@
+name: build
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Тесты
+        run: cargo test --locked
+      - name: Сборка
+        run: cargo build --locked --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: yandex-music-rust-windows-x64
+          path: |
+            target/release/yandex-music-rust.exe
+            target/release/yandex-music-mcp.exe
+          if-no-files-found: error

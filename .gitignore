@@ -1,0 +1,14 @@
+# Артефакты сборки Rust
+/target/
+*.pdb
+*.ilk
+
+# Готовые сборки живут в GitHub Releases, а не в истории git
+*.exe
+/v0.1.*/
+
+# Служебные файлы Windows и редакторов
+desktop.ini
+Thumbs.db
+.vscode/
+.idea/

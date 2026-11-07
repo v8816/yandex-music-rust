@@ -1,0 +1,10 @@
+mod api;
+mod auth;
+mod covers;
+mod equalizer;
+pub mod mcp;
+mod media;
+mod player;
+pub mod stream;
+pub mod ui;
+mod worker;
