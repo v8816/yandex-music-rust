@@ -524,6 +524,68 @@ impl Api {
         })
     }
 
+    pub fn liked_ids(&self) -> Result<std::collections::HashSet<u64>> {
+        let uid = self.uid.context("Сначала войдите")?;
+        let body = self.get(&format!("users/{uid}/likes/tracks"), &[])?;
+        Ok(body
+            .pointer("/library/tracks")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|t| t["id"].as_u64().or_else(|| t["id"].as_str()?.parse().ok()))
+            .collect())
+    }
+
+    fn playlist_post(&self, path: &str, form: &[(&str, String)]) -> Result<Value> {
+        let response = self
+            .request(reqwest::Method::POST, path)
+            .form(form)
+            .send()?;
+        let status = response.status();
+        let body: Value = response.json()?;
+        ensure!(
+            status.is_success() && body.get("error").is_none(),
+            "{}",
+            service_error(status, &body)
+        );
+        Ok(body.get("result").cloned().unwrap_or(body))
+    }
+
+    pub fn create_playlist(&self, title: &str) -> Result<Value> {
+        ensure!(
+            !title.trim().is_empty() && title.chars().count() <= 100,
+            "Название: 1–100 символов"
+        );
+        let uid = self.uid.context("Сначала войдите")?;
+        self.playlist_post(
+            &format!("users/{uid}/playlists/create"),
+            &[
+                ("title", title.trim().into()),
+                ("visibility", "private".into()),
+            ],
+        )
+    }
+
+    pub fn add_to_playlist(&self, kind: &str, id: u64) -> Result<Value> {
+        ensure!(
+            !kind.is_empty() && kind.bytes().all(|b| b.is_ascii_digit()) && kind != "3",
+            "Выберите собственный плейлист"
+        );
+        let uid = self.uid.context("Сначала войдите")?;
+        let body = self.get(&format!("users/{uid}/playlists/{kind}"), &[])?;
+        let revision = body["revision"].as_u64().context("Нет ревизии плейлиста")?;
+        let track = self.track(id)?;
+        let album = track.albums.first().context("Нет альбома трека")?.id;
+        let diff = json!([{"op":"insert","at":0,"tracks":[{"id":id.to_string(),"albumId":album.to_string()}]}]);
+        self.playlist_post(
+            &format!("users/{uid}/playlists/{kind}/change-relative"),
+            &[
+                ("revision", revision.to_string()),
+                ("diff", diff.to_string()),
+            ],
+        )
+    }
+
     pub fn like(&self, track: u64, liked: bool) -> Result<()> {
         let uid = self.uid.context("Сначала войдите в аккаунт")?;
         let action = if liked { "add-multiple" } else { "remove" };

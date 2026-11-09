@@ -6,6 +6,7 @@ mod equalizer;
 pub mod mcp;
 mod media;
 mod player;
+mod preferences;
 pub mod stream;
 pub mod ui;
 mod worker;

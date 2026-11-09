@@ -58,6 +58,10 @@ pub struct Snapshot {
     #[serde(skip_serializing, default)]
     pub account_name: String,
     pub rpc: bool,
+    #[serde(default)]
+    pub liked: HashSet<u64>,
+    #[serde(default)]
+    pub rpc_settings: crate::preferences::RpcSettings,
     pub lossless: bool,
     pub error: String,
 }
@@ -155,6 +159,13 @@ impl Player {
                         .map(|tracks| json!(tracks)),
                     "library" => api.library().map(|tracks| json!(tracks)),
                     "playlists" => api.playlists().map(|playlists| json!(playlists)),
+                    "playlist_create" => {
+                        api.create_playlist(args["title"].as_str().unwrap_or_default())
+                    }
+                    "playlist_add" => api.add_to_playlist(
+                        args["playlist_id"].as_str().unwrap_or_default(),
+                        args["track_id"].as_u64().unwrap_or(0),
+                    ),
                     "playlist_tracks" => api
                         .playlist_tracks(args["playlist_id"].as_str().unwrap_or_default())
                         .map(|tracks| json!(tracks)),
@@ -173,6 +184,7 @@ impl Player {
                 volume: 0.75,
                 repeat: "off".into(),
                 rpc: true,
+                rpc_settings: crate::preferences::RpcSettings::load(),
                 ..Snapshot::default()
             },
             stream: None,
@@ -312,6 +324,8 @@ impl Player {
             },
             "library" => ("library", json!({})),
             "playlists" => ("playlists", json!({})),
+            "playlist_add" => ("playlist_add", job.args.clone()),
+            "playlist_create" => ("playlist_create", job.args.clone()),
             "playlist_tracks" | "play_playlist" => match job.args["playlist_id"].as_str() {
                 Some(id) if !id.is_empty() => ("playlist_tracks", json!({ "playlist_id": id })),
                 _ => {
@@ -679,8 +693,24 @@ impl Player {
                     .end(now + (state.duration - state.position) as i64),
             );
         }
+        let mut payload = serde_json::to_value(activity).unwrap_or_default();
+        payload["name"] = json!(
+            state
+                .rpc_settings
+                .display_name(&artist, &title)
+                .chars()
+                .take(128)
+                .collect::<String>()
+        );
+        payload["status_display_type"] = json!(0);
+        if !state.rpc_settings.links {
+            payload.as_object_mut().unwrap().remove("buttons");
+        }
+        if state.rpc_settings.language == "en" && state.rpc_settings.links {
+            payload["buttons"] = json!([{"label":"Open in app","url":app_link},{"label":"Open on website","url":link}]);
+        }
         if let Some(rpc) = &mut self.discord
-            && rpc.set_activity(activity).is_err()
+            && rpc.send(json!({"cmd":"SET_ACTIVITY","args":{"pid":std::process::id(),"activity":payload},"nonce":format!("{}-{now}", track.id)}), 1).is_err()
         {
             self.discord = None;
         }
@@ -717,6 +747,7 @@ impl Player {
                     .context("Введите OAuth-токен")?;
                 self.state.account_name = self.api.login(token.to_owned())?;
                 self.state.logged_in = true;
+                self.state.liked = self.api.liked_ids().unwrap_or_default();
                 let stored = if a["remember"].as_bool() == Some(true) {
                     crate::auth::save(token)
                 } else if a["remember"].as_bool() == Some(false) {
@@ -746,6 +777,7 @@ impl Player {
                 self.api.logout();
                 self.state.logged_in = false;
                 self.state.account_name.clear();
+                self.state.liked.clear();
                 self.update_rpc();
                 if let Some(error) = storage_error {
                     self.state.error =
@@ -850,6 +882,11 @@ impl Player {
                         .id
                 };
                 self.api.like(id, name == "like")?;
+                if name == "like" {
+                    self.state.liked.insert(id);
+                } else {
+                    self.state.liked.remove(&id);
+                }
             }
             "repeat" => {
                 let mode = a["mode"].as_str().context("Укажите режим повтора")?;
@@ -881,6 +918,21 @@ impl Player {
                 self.state.equalizer = settings;
             }
             "lossless" => self.state.lossless = boolean()?,
+            "stop" => {
+                self.loader.cancel();
+                self.sink = None;
+                self.stream = None;
+                self.state.playing = false;
+                self.state.loading = false;
+                self.clear_rpc();
+            }
+            "rpc_settings" => {
+                let settings: crate::preferences::RpcSettings = serde_json::from_value(a.clone())?;
+                settings.validate()?;
+                settings.save()?;
+                self.state.rpc_settings = settings;
+                self.update_rpc();
+            }
             "discord_rpc" => {
                 self.state.rpc = boolean()?;
                 self.update_rpc();
@@ -903,5 +955,19 @@ mod snapshot_tests {
         assert!(json.get("account_name").is_none());
         let restored: super::Snapshot = serde_json::from_value(json).unwrap();
         assert!(restored.account_name.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod like_state_tests {
+    #[test]
+    fn snapshot_contains_all_liked_tracks_not_only_the_current_one() {
+        let mut snapshot = super::Snapshot::default();
+        snapshot.liked.extend([123, 456]);
+        let decoded: super::Snapshot =
+            serde_json::from_value(serde_json::to_value(snapshot).unwrap()).unwrap();
+        assert!(decoded.liked.contains(&123));
+        assert!(decoded.liked.contains(&456));
+        assert!(!decoded.liked.contains(&789));
     }
 }

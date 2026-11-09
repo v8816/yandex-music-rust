@@ -23,7 +23,7 @@ pub struct Covers {
 
 enum Cover {
     Loading,
-    Ready(TextureHandle),
+    Ready(TextureHandle, Color32),
     Unavailable,
 }
 
@@ -67,15 +67,40 @@ impl Covers {
         for (uri, image) in self.results.try_iter() {
             if let Some((_, cover)) = self.entries.get_mut(&uri) {
                 *cover = image.map_or(Cover::Unavailable, |image| {
-                    Cover::Ready(ctx.load_texture("track-cover", image, TextureOptions::LINEAR))
+                    let mut rgb = [0u64; 3];
+                    for pixel in &image.pixels {
+                        rgb[0] += pixel.r() as u64;
+                        rgb[1] += pixel.g() as u64;
+                        rgb[2] += pixel.b() as u64;
+                    }
+                    let n = image.pixels.len().max(1) as u64;
+                    let color = Color32::from_rgb(
+                        (rgb[0] / n) as u8,
+                        (rgb[1] / n) as u8,
+                        (rgb[2] / n) as u8,
+                    );
+                    Cover::Ready(
+                        ctx.load_texture("track-cover", image, TextureOptions::LINEAR),
+                        color,
+                    )
                 });
             }
         }
     }
 
-    pub fn draw(&mut self, ui: &mut egui::Ui, uri: Option<&str>, size: f32) {
+    pub fn palette(&self, uri: Option<&str>) -> Color32 {
+        uri.and_then(|uri| self.entries.get(uri))
+            .and_then(|(_, c)| match c {
+                Cover::Ready(_, color) => Some(*color),
+                _ => None,
+            })
+            .unwrap_or(Color32::from_rgb(65, 45, 90))
+    }
+
+    pub fn draw(&mut self, ui: &mut egui::Ui, uri: Option<&str>, size: f32) -> egui::Response {
         let texture = uri.and_then(|uri| self.texture(ui.ctx(), uri));
-        let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(size), egui::Sense::hover());
+        let (rect, response) =
+            ui.allocate_exact_size(egui::Vec2::splat(size), egui::Sense::click());
         if let Some(id) = texture {
             let image = egui::Image::new((id, rect.size())).corner_radius(8);
             image.paint_at(ui, rect);
@@ -90,6 +115,7 @@ impl Covers {
                 Color32::from_gray(156),
             );
         }
+        response
     }
 
     fn texture(&mut self, ctx: &Context, uri: &str) -> Option<egui::TextureId> {
@@ -97,7 +123,7 @@ impl Covers {
         if let Some((seen, entry)) = self.entries.get_mut(uri) {
             *seen = frame;
             return match entry {
-                Cover::Ready(texture) => Some(texture.id()),
+                Cover::Ready(texture, _) => Some(texture.id()),
                 _ => None,
             };
         }

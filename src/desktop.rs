@@ -33,18 +33,57 @@ pub fn icon() -> egui::IconData {
 #[cfg(windows)]
 pub struct Tray {
     _icon: tray_icon::TrayIcon,
-    pub show: tray_icon::menu::MenuId,
-    pub play: tray_icon::menu::MenuId,
-    pub next: tray_icon::menu::MenuId,
-    pub quit: tray_icon::menu::MenuId,
+}
+
+#[cfg(windows)]
+fn show_player(ctx: &egui::Context) {
+    use windows::Win32::{
+        Foundation::{BOOL, HWND, LPARAM},
+        UI::WindowsAndMessaging::{
+            EnumWindows, GetWindowTextLengthW, GetWindowThreadProcessId, SW_RESTORE,
+            SetForegroundWindow, ShowWindow,
+        },
+    };
+    unsafe extern "system" fn find_own_window(window: HWND, data: LPARAM) -> BOOL {
+        let mut pid = 0;
+        unsafe {
+            GetWindowThreadProcessId(window, Some(&mut pid));
+        }
+        if pid == std::process::id() && unsafe { GetWindowTextLengthW(window) } > 0 {
+            unsafe {
+                *(data.0 as *mut HWND) = window;
+            }
+            return BOOL(0);
+        }
+        BOOL(1)
+    }
+    unsafe {
+        let mut window = HWND::default();
+        let _ = EnumWindows(
+            Some(find_own_window),
+            LPARAM(&mut window as *mut HWND as isize),
+        );
+        if window.0 != 0 {
+            let _ = ShowWindow(window, SW_RESTORE);
+            let _ = SetForegroundWindow(window);
+        }
+    }
+    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    ctx.request_repaint();
 }
 
 #[cfg(windows)]
 impl Tray {
-    pub fn new(_ctx: &egui::Context) -> Option<Self> {
+    pub fn new(
+        ctx: &egui::Context,
+        tx: std::sync::mpsc::SyncSender<crate::player::Job>,
+        state: std::sync::Arc<std::sync::Mutex<crate::player::Snapshot>>,
+    ) -> Option<Self> {
         use tray_icon::{
-            Icon, TrayIconBuilder,
-            menu::{Menu, MenuItem},
+            Icon, TrayIconBuilder, TrayIconEvent,
+            menu::{Menu, MenuEvent, MenuItem},
         };
         let menu = Menu::new();
         let show = MenuItem::new("Открыть плеер", true, None);
@@ -59,12 +98,39 @@ impl Tray {
             .with_menu(Box::new(menu))
             .build()
             .ok()?;
-        Some(Self {
-            _icon: icon,
-            show: show.id().clone(),
-            play: play.id().clone(),
-            next: next.id().clone(),
-            quit: quit.id().clone(),
-        })
+        let (show, play, next, quit) = (
+            show.id().clone(),
+            play.id().clone(),
+            next.id().clone(),
+            quit.id().clone(),
+        );
+        let context = ctx.clone();
+        MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+            if event.id == show {
+                show_player(&context);
+            } else if event.id == play {
+                let playing = state.lock().map(|s| s.playing).unwrap_or(false);
+                let _ = crate::player::submit(
+                    &tx,
+                    if playing { "pause" } else { "play" },
+                    serde_json::json!({}),
+                );
+            } else if event.id == next {
+                let _ = crate::player::submit(&tx, "next", serde_json::json!({}));
+            } else if event.id == quit {
+                if let Ok(reply) = crate::player::submit(&tx, "stop", serde_json::json!({})) {
+                    let _ = reply.recv_timeout(std::time::Duration::from_secs(1));
+                }
+                std::process::exit(0);
+            }
+            context.request_repaint();
+        }));
+        let context = ctx.clone();
+        TrayIconEvent::set_event_handler(Some(move |event| {
+            if matches!(event, TrayIconEvent::DoubleClick { .. }) {
+                show_player(&context);
+            }
+        }));
+        Some(Self { _icon: icon })
     }
 }
