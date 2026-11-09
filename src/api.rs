@@ -187,10 +187,7 @@ fn playlists_from_items(items: Vec<Value>) -> Vec<Playlist> {
                 .map(|n| n.to_string())
                 .or_else(|| item["id"].as_str().map(str::to_owned))
                 .unwrap_or_default(),
-            title: item["title"]
-                .as_str()
-                .unwrap_or("Без названия")
-                .to_owned(),
+            title: item["title"].as_str().unwrap_or("Без названия").to_owned(),
             owner: item
                 .pointer("/owner/name")
                 .and_then(Value::as_str)
@@ -252,7 +249,9 @@ fn service_error(status: reqwest::StatusCode, body: &Value) -> String {
     let message = body.pointer("/error/message").and_then(Value::as_str);
     let message = message.map(|message| message.chars().take(200).collect::<String>());
     match (name, message) {
-        (Some(name), Some(message)) => format!("Яндекс Музыка вернула HTTP {status}: {name} — {message}"),
+        (Some(name), Some(message)) => {
+            format!("Яндекс Музыка вернула HTTP {status}: {name} — {message}")
+        }
         (None, Some(message)) => format!("Яндекс Музыка вернула HTTP {status}: {message}"),
         _ => format!("Яндекс Музыка вернула HTTP {status}"),
     }
@@ -336,6 +335,7 @@ impl Api {
     }
 
     pub fn wave_more(&self, session: &str, queue: Vec<String>) -> Result<WaveBatch> {
+        ensure!(valid_session(session), "Некорректный номер сессии");
         let batch = self.wave_request(
             &format!("rotor/session/{session}/tracks"),
             json!({"queue":&queue}),
@@ -367,6 +367,9 @@ impl Api {
     }
 
     pub fn wave_feedback(&self, session: &str, event: &Value) {
+        if !valid_session(session) {
+            return;
+        }
         let _ = self
             .request(
                 reqwest::Method::POST,
@@ -414,11 +417,15 @@ impl Api {
             "search",
             &[("text", query), ("type", "track"), ("page", "0")],
         )?;
-        Ok(serde_json::from_value(
+        let tracks: Vec<Track> = serde_json::from_value(
             v.pointer("/tracks/results")
                 .cloned()
                 .unwrap_or(Value::Array(vec![])),
-        )?)
+        )?;
+        Ok(tracks
+            .into_iter()
+            .filter(|track| track.available != Some(false))
+            .collect())
     }
 
     pub fn track(&self, id: u64) -> Result<Track> {
@@ -517,6 +524,68 @@ impl Api {
         })
     }
 
+    pub fn liked_ids(&self) -> Result<std::collections::HashSet<u64>> {
+        let uid = self.uid.context("Сначала войдите")?;
+        let body = self.get(&format!("users/{uid}/likes/tracks"), &[])?;
+        Ok(body
+            .pointer("/library/tracks")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|t| t["id"].as_u64().or_else(|| t["id"].as_str()?.parse().ok()))
+            .collect())
+    }
+
+    fn playlist_post(&self, path: &str, form: &[(&str, String)]) -> Result<Value> {
+        let response = self
+            .request(reqwest::Method::POST, path)
+            .form(form)
+            .send()?;
+        let status = response.status();
+        let body: Value = response.json()?;
+        ensure!(
+            status.is_success() && body.get("error").is_none(),
+            "{}",
+            service_error(status, &body)
+        );
+        Ok(body.get("result").cloned().unwrap_or(body))
+    }
+
+    pub fn create_playlist(&self, title: &str) -> Result<Value> {
+        ensure!(
+            !title.trim().is_empty() && title.chars().count() <= 100,
+            "Название: 1–100 символов"
+        );
+        let uid = self.uid.context("Сначала войдите")?;
+        self.playlist_post(
+            &format!("users/{uid}/playlists/create"),
+            &[
+                ("title", title.trim().into()),
+                ("visibility", "private".into()),
+            ],
+        )
+    }
+
+    pub fn add_to_playlist(&self, kind: &str, id: u64) -> Result<Value> {
+        ensure!(
+            !kind.is_empty() && kind.bytes().all(|b| b.is_ascii_digit()) && kind != "3",
+            "Выберите собственный плейлист"
+        );
+        let uid = self.uid.context("Сначала войдите")?;
+        let body = self.get(&format!("users/{uid}/playlists/{kind}"), &[])?;
+        let revision = body["revision"].as_u64().context("Нет ревизии плейлиста")?;
+        let track = self.track(id)?;
+        let album = track.albums.first().context("Нет альбома трека")?.id;
+        let diff = json!([{"op":"insert","at":0,"tracks":[{"id":id.to_string(),"albumId":album.to_string()}]}]);
+        self.playlist_post(
+            &format!("users/{uid}/playlists/{kind}/change-relative"),
+            &[
+                ("revision", revision.to_string()),
+                ("diff", diff.to_string()),
+            ],
+        )
+    }
+
     pub fn like(&self, track: u64, liked: bool) -> Result<()> {
         let uid = self.uid.context("Сначала войдите в аккаунт")?;
         let action = if liked { "add-multiple" } else { "remove" };
@@ -540,21 +609,22 @@ impl Api {
 
     pub fn playlists(&self) -> Result<Vec<Playlist>> {
         let uid = self.uid.context("Сначала войдите в аккаунт")?;
-        if let Ok(body) = self.get_with_timeout(&format!("users/{uid}/playlists/list"), &[], LONG_TIMEOUT)
+        if let Ok(body) =
+            self.get_with_timeout(&format!("users/{uid}/playlists/list"), &[], LONG_TIMEOUT)
+            && (body.get("playlists").is_some() || body.is_array())
         {
-            if body.get("playlists").is_some() || body.is_array() {
-                return Ok(playlists_from_items(list_items(&body, "playlists")));
-            }
+            return Ok(playlists_from_items(list_items(&body, "playlists")));
         }
-        let kinds = kinds_from(
-            &self.get(&format!("users/{uid}/playlists/list/kinds"), &[])?,
-        );
+        let kinds = kinds_from(&self.get(&format!("users/{uid}/playlists/list/kinds"), &[])?);
         if kinds.is_empty() {
             return Ok(vec![]);
         }
         let response = self
             .request(reqwest::Method::POST, &format!("users/{uid}/playlists"))
-            .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
             .body(kinds_form(&kinds))
             .send()
             .context("Не удалось получить плейлисты")?;
@@ -591,7 +661,11 @@ impl Api {
         let items = list_items(&body, "tracks");
         let likes = likes || body.pointer("/kind").and_then(Value::as_u64) == Some(3);
         if items.is_empty() {
-            return if likes { self.liked_tracks() } else { Ok(vec![]) };
+            return if likes {
+                self.liked_tracks()
+            } else {
+                Ok(vec![])
+            };
         }
         let mut tracks = Vec::with_capacity(items.len());
         let mut missing = Vec::new();
@@ -631,31 +705,6 @@ impl Api {
         Ok(tracks)
     }
 
-    pub fn audio_while(
-        &self,
-        track: u64,
-        lossless: bool,
-        keep: impl Fn() -> bool,
-    ) -> Result<Option<(Vec<u8>, String)>> {
-        let (url, codec) = self.download_url(track, lossless)?;
-        let mut response = self.open_audio(url)?;
-        let expected = response.content_length().unwrap_or(0);
-        let mut bytes = Vec::with_capacity(expected.min(16 * 1024 * 1024) as usize);
-        let mut chunk = vec![0u8; 64 * 1024];
-        loop {
-            if !keep() {
-                return Ok(None);
-            }
-            let read = response.read(&mut chunk)?;
-            if read == 0 {
-                break;
-            }
-            bytes.extend_from_slice(&chunk[..read]);
-            ensure!(bytes.len() as u64 <= MAX_AUDIO, "Аудиофайл слишком большой");
-        }
-        Ok(Some((bytes, codec)))
-    }
-
     pub fn stream_audio(
         &self,
         track: u64,
@@ -665,7 +714,8 @@ impl Api {
         let (url, codec) = self.download_url(track, lossless)?;
         let mut response = self.open_audio(url)?;
         let total = response.content_length();
-        let buffer = SharedBuffer::new(MAX_AUDIO as usize, total);
+        let buffer = SharedBuffer::new(MAX_AUDIO as usize, total)
+            .context("Не удалось создать временный аудиокэш")?;
         buffer.set_patience(stream::PROBE_PATIENCE);
         let prefix = PREFIX.min(total.unwrap_or(u64::MAX)) as usize;
         let mut chunk = vec![0u8; 64 * 1024];
@@ -779,6 +829,14 @@ impl Api {
     }
 }
 
+fn valid_session(session: &str) -> bool {
+    !session.is_empty()
+        && session.len() <= 512
+        && session
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -885,11 +943,12 @@ mod tests {
         let mut api = Api::new().unwrap();
         api.uid = Some(103_372_440);
         let playlists = api.playlists().unwrap();
-        assert!(!playlists.is_empty(), "список плейлистов не должен быть пустым");
         assert!(
-            playlists
-                .iter()
-                .all(|playlist| !playlist.title.is_empty()),
+            !playlists.is_empty(),
+            "список плейлистов не должен быть пустым"
+        );
+        assert!(
+            playlists.iter().all(|playlist| !playlist.title.is_empty()),
             "у каждого плейлиста должно быть название"
         );
         let playlist = playlists
@@ -905,7 +964,11 @@ mod tests {
             .map(|track| track.id)
             .collect::<Vec<_>>();
         let hydrated = api.tracks_by_ids(&ids).unwrap();
-        assert_eq!(hydrated.len(), ids.len(), "треки добираются по идентификаторам");
+        assert_eq!(
+            hydrated.len(),
+            ids.len(),
+            "треки добираются по идентификаторам"
+        );
         assert!(hydrated.iter().all(|track| !track.title.is_empty()));
     }
 
@@ -915,7 +978,10 @@ mod tests {
         let api = Api::new().unwrap();
         let info = api.artist(13_905).unwrap();
         assert_eq!(info.name, "Daft Punk");
-        assert!(!info.description.is_empty(), "описание исполнителя приходит");
+        assert!(
+            !info.description.is_empty(),
+            "описание исполнителя приходит"
+        );
         assert!(info.cover_uri.is_some(), "обложка исполнителя приходит");
         assert!(info.listeners > 0, "статистика приходит");
         assert!(!info.tracks.is_empty(), "треки исполнителя приходят");
@@ -937,5 +1003,16 @@ mod tests {
                 .iter()
                 .any(|next| tracks.iter().all(|old| old.id != next.id))
         );
+    }
+}
+
+#[cfg(test)]
+mod session_validation_tests {
+    #[test]
+    fn session_cannot_change_endpoint() {
+        for value in ["", "../account", "id?x=1", "a/b", "a#b", "a%2fb"] {
+            assert!(!super::valid_session(value));
+        }
+        assert!(super::valid_session("abc-123_DEF"));
     }
 }

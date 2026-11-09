@@ -72,6 +72,13 @@ struct App {
     media: Option<MediaKeys>,
     media_error: String,
     text_focus: bool,
+    #[cfg(windows)]
+    tray: Option<crate::desktop::Tray>,
+    quitting: bool,
+    detail_track: Option<Track>,
+    playlist_dialog: bool,
+    playlist_title: String,
+    create_track: Option<Track>,
 }
 
 pub fn run() -> eframe::Result {
@@ -79,8 +86,9 @@ pub fn run() -> eframe::Result {
         "Яндекс Музыка · Rust",
         eframe::NativeOptions {
             viewport: ViewportBuilder::default()
+                .with_icon(crate::desktop::icon())
                 .with_inner_size([1060.0, 710.0])
-                .with_min_inner_size([410.0, 155.0]),
+                .with_min_inner_size([560.0, 480.0]),
             ..Default::default()
         },
         Box::new(|cc| Ok(Box::new(App::new(&cc.egui_ctx)))),
@@ -89,6 +97,10 @@ pub fn run() -> eframe::Result {
 
 impl App {
     fn new(ctx: &Context) -> Self {
+        Self::new_internal(ctx, true)
+    }
+
+    fn new_internal(ctx: &Context, connect: bool) -> Self {
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = Color32::from_rgb(17, 17, 20);
         visuals.extreme_bg_color = Color32::from_gray(13);
@@ -110,23 +122,42 @@ impl App {
             style.spacing.button_padding = egui::vec2(12.0, 6.0);
         });
         let mut fonts = FontDefinitions::default();
-        if let Some(windows) = std::env::var_os("WINDIR") {
+        if let Some(windows) = std::env::var_os("WINDIR")
+            && let Ok(bytes) =
+                std::fs::read(std::path::PathBuf::from(&windows).join("Fonts/segoeui.ttf"))
+        {
+            fonts
+                .font_data
+                .insert("segoe".into(), Arc::new(FontData::from_owned(bytes)));
+            fonts.font_data.retain(|name, _| name == "segoe");
+            for names in fonts.families.values_mut() {
+                *names = vec!["segoe".into()];
+            }
             if let Ok(bytes) =
-                std::fs::read(std::path::PathBuf::from(windows).join("Fonts/segoeui.ttf"))
+                std::fs::read(std::path::PathBuf::from(&windows).join("Fonts/consola.ttf"))
             {
                 fonts
                     .font_data
-                    .insert("segoe".into(), Arc::new(FontData::from_owned(bytes)));
+                    .insert("consolas".into(), Arc::new(FontData::from_owned(bytes)));
                 fonts
                     .families
-                    .entry(FontFamily::Proportional)
-                    .or_default()
-                    .insert(0, "segoe".into());
+                    .insert(FontFamily::Monospace, vec!["consolas".into()]);
             }
         }
         ctx.set_fonts(fonts);
         let repaint = ctx.clone();
-        let (tx, state) = player::start(move || repaint.request_repaint());
+        let (tx, state) = if connect {
+            player::start(move || repaint.request_repaint())
+        } else {
+            let (tx, _) = std::sync::mpsc::sync_channel(1);
+            (tx, Arc::new(Mutex::new(Snapshot::default())))
+        };
+        #[cfg(windows)]
+        let tray = if connect {
+            crate::desktop::Tray::new(ctx, tx.clone(), state.clone())
+        } else {
+            None
+        };
         let mut app = Self {
             tx,
             state,
@@ -165,12 +196,21 @@ impl App {
             media: None,
             media_error: String::new(),
             text_focus: false,
+            #[cfg(windows)]
+            tray,
+            quitting: false,
+            detail_track: None,
+            playlist_dialog: false,
+            playlist_title: String::new(),
+            create_track: None,
         };
+        if !connect {
+            return app;
+        }
         match media::start(app.tx.clone(), app.state.clone()) {
             Some(keys) => app.media = Some(keys),
             None => {
-                app.media_error =
-                    "Не удалось перехватить мультимедийные клавиши".into();
+                app.media_error = "Не удалось перехватить мультимедийные клавиши".into();
             }
         }
         if let Ok(token) = std::env::var("YANDEX_MUSIC_TOKEN") {
@@ -320,6 +360,24 @@ impl App {
                         self.playlist_error.clear();
                         self.account_status = "Вы вышли из аккаунта".into();
                     }
+                    "playlist_add" => {
+                        self.status = "Трек добавлен в плейлист".into();
+                    }
+                    "playlist_create" => {
+                        self.playlist_dialog = false;
+                        if let Some(track) = self.create_track.take()
+                            && let Some(kind) = v["kind"]
+                                .as_u64()
+                                .map(|n| n.to_string())
+                                .or_else(|| v["kind"].as_str().map(str::to_owned))
+                        {
+                            self.send(
+                                "playlist_add",
+                                json!({"playlist_id":kind,"track_id":track.id}),
+                            );
+                        }
+                        self.send("playlists", json!({}));
+                    }
                     "like" => self.status = "Добавлено в любимое".into(),
                     "unlike" => self.status = "Убрано из любимого".into(),
                     _ => self.status.clear(),
@@ -412,59 +470,56 @@ impl App {
             .exact_width(190.0)
             .frame(
                 Frame::new()
-                    .fill(Color32::from_rgb(23, 23, 27))
-                    .inner_margin(Margin::same(14)),
+                    .fill(Color32::from_rgb(20, 20, 24))
+                    .inner_margin(14),
             )
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("♫").color(YELLOW).size(27.0).strong());
-                    ui.label(RichText::new("Яндекс Музыка").size(17.0).strong());
-                });
-                ui.add_space(19.0);
-                ui.label(
-                    RichText::new("  ОБЗОР")
-                        .size(10.5)
-                        .color(Color32::from_gray(148))
-                        .strong(),
-                );
-                for (page, title) in [(Page::Home, "Главная"), (Page::Search, "Поиск")]
-                {
-                    if nav_item(ui, title, Some(page), self.page == page) {
-                        self.navigate(page, s.logged_in);
-                    }
-                }
-                ui.add_space(13.0);
-                ui.label(
-                    RichText::new("  МОЯ МУЗЫКА")
-                        .size(10.5)
-                        .color(Color32::from_gray(148))
-                        .strong(),
-                );
-                for (page, title) in [(Page::Library, "Любимое"), (Page::Playlists, "Плейлисты"), (Page::Queue, "Очередь")]
-                {
-                    if nav_item(ui, title, Some(page), self.page == page) {
-                        self.navigate(page, s.logged_in);
-                    }
-                }
-                ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
-                    let account = if s.logged_in {
-                        s.account_name.as_str()
-                    } else {
-                        "Войти в Яндекс ID"
-                    };
-                    if nav_item(ui, account, None, false) {
-                        self.navigate(Page::Settings, s.logged_in);
-                    }
-                    ui.separator();
-                    if nav_item(
-                        ui,
-                        "Настройки",
-                        Some(Page::Settings),
-                        self.page == Page::Settings,
-                    ) {
-                        self.navigate(Page::Settings, s.logged_in);
-                    }
-                });
+                ScrollArea::vertical()
+                    .id_salt("navigation")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("Яндекс Музыка").size(19.0).strong());
+                        ui.add_space(22.0);
+                        for (page, title) in [(Page::Home, "Главная"), (Page::Search, "Поиск")]
+                        {
+                            if nav_item(ui, title, Some(page), self.page == page) {
+                                self.navigate(page, s.logged_in);
+                            }
+                        }
+                        ui.add_space(20.0);
+                        ui.label(
+                            RichText::new("МОЯ МУЗЫКА")
+                                .size(10.0)
+                                .color(Color32::from_gray(130)),
+                        );
+                        for (page, title) in [
+                            (Page::Library, "Любимое"),
+                            (Page::Playlists, "Плейлисты"),
+                            (Page::Queue, "Очередь"),
+                        ] {
+                            if nav_item(ui, title, Some(page), self.page == page) {
+                                self.navigate(page, s.logged_in);
+                            }
+                        }
+                        ui.add_space(18.0);
+                        ui.separator();
+                        if nav_item(
+                            ui,
+                            "Настройки",
+                            Some(Page::Settings),
+                            self.page == Page::Settings,
+                        ) {
+                            self.navigate(Page::Settings, s.logged_in);
+                        }
+                        let account = if s.logged_in {
+                            s.account_name.as_str()
+                        } else {
+                            "Войти в Яндекс ID"
+                        };
+                        if nav_item(ui, account, None, false) {
+                            self.navigate(Page::Settings, s.logged_in);
+                        }
+                    });
             });
     }
 
@@ -582,15 +637,16 @@ impl App {
                 let mut media = self.media.is_some();
                 if ui
                     .checkbox(&mut media, "Мультимедийные клавиши клавиатуры")
-                    .on_hover_text("Плей/пауза, следующий и предыдущий трек работают при свёрнутом окне")
+                    .on_hover_text(
+                        "Плей/пауза, следующий и предыдущий трек работают при свёрнутом окне",
+                    )
                     .changed()
                 {
                     if media {
                         match media::start(self.tx.clone(), self.state.clone()) {
                             Some(keys) => self.media = Some(keys),
                             None => {
-                                self.media_error =
-                                    "Не удалось перехватить клавиши".into();
+                                self.media_error = "Не удалось перехватить клавиши".into();
                             }
                         }
                     } else {
@@ -608,6 +664,42 @@ impl App {
                 let mut rpc = s.rpc;
                 if ui.checkbox(&mut rpc, "Discord Rich Presence").changed() {
                     self.send("discord_rpc", json!({"enabled":rpc}));
+                }
+                let mut settings = s.rpc_settings.clone();
+                let before = serde_json::to_value(&settings).unwrap_or_default();
+                ui.label("Название статуса");
+                egui::ComboBox::from_id_salt("rpc-title")
+                    .selected_text(match settings.title.as_str() {
+                        "app" => "Яндекс Музыка",
+                        "artist" => "Артист",
+                        "track" => "Трек",
+                        _ => "Артист — Трек",
+                    })
+                    .show_ui(ui, |ui| {
+                        for (value, label) in [
+                            ("app", "Яндекс Музыка"),
+                            ("artist", "Артист"),
+                            ("artist_track", "Артист — Трек"),
+                            ("track", "Трек"),
+                        ] {
+                            ui.selectable_value(&mut settings.title, value.into(), label);
+                        }
+                    });
+                ui.label("Язык статуса");
+                egui::ComboBox::from_id_salt("rpc-language")
+                    .selected_text(if settings.language == "ru" {
+                        "Русский"
+                    } else {
+                        "English"
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut settings.language, "ru".into(), "Русский");
+                        ui.selectable_value(&mut settings.language, "en".into(), "English");
+                    });
+                ui.checkbox(&mut settings.links, "Ссылки на трек — кнопки в Discord");
+                let after = serde_json::to_value(&settings).unwrap_or_default();
+                if before != after {
+                    self.send("rpc_settings", after);
                 }
                 ui.separator();
                 let mut enabled = self.bridge.is_some();
@@ -796,18 +888,20 @@ impl App {
         self.rows(ui, &tracks, current, false);
     }
 
-    fn rows(&mut self, ui: &mut egui::Ui, tracks: &[Track], current: Option<usize>, queue: bool) {
+    fn rows(&mut self, ui: &mut egui::Ui, tracks: &[Track], _current: Option<usize>, queue: bool) {
+        let snapshot = self.state.lock().unwrap_or_else(|e| e.into_inner()).clone();
         ScrollArea::vertical()
             .id_salt(if queue { "queue" } else { "tracks" })
             .auto_shrink([false, false])
             .show_rows(ui, 54.0, tracks.len(), |ui, range| {
                 for index in range {
                     let track = &tracks[index];
-                    let selected = current == Some(index);
+                    let selected = snapshot.track.as_ref().is_some_and(|t| t.id == track.id);
                     ui.push_id(index, |ui| {
                         let width = ui.available_width();
-                        let (rect, _) =
-                            ui.allocate_exact_size(egui::vec2(width, 54.0), egui::Sense::hover());
+                        let (rect, response) =
+                            ui.allocate_exact_size(egui::vec2(width, 54.0), egui::Sense::click());
+                        self.track_menu(&response, track);
                         if selected || ui.rect_contains_pointer(rect) {
                             ui.painter()
                                 .rect_filled(rect, 10, Color32::from_rgb(35, 34, 43));
@@ -817,13 +911,33 @@ impl App {
                                 .max_rect(rect.shrink2(egui::vec2(8.0, 4.0)))
                                 .layout(Layout::left_to_right(Align::Center)),
                             |ui| {
-                                self.covers.draw(ui, track.cover(), 46.0);
-                                if ui
-                                    .add(icon_button("▶", selected))
-                                    .on_hover_text("Воспроизвести")
-                                    .clicked()
+                                let cover = self.covers.draw(ui, track.cover(), 46.0);
+                                if cover.clicked() {
+                                    self.detail_track = Some(track.clone());
+                                }
+                                self.track_menu(&cover, track);
+                                if control(
+                                    ui,
+                                    if selected && snapshot.playing {
+                                        ControlIcon::Pause
+                                    } else {
+                                        ControlIcon::Play
+                                    },
+                                    if selected && snapshot.playing {
+                                        "Пауза"
+                                    } else {
+                                        "Играть"
+                                    },
+                                    selected,
+                                )
+                                .clicked()
                                 {
-                                    if queue {
+                                    if selected {
+                                        self.send(
+                                            if snapshot.playing { "pause" } else { "play" },
+                                            json!({}),
+                                        );
+                                    } else if queue {
                                         self.send("queue_play", json!({"index":index}));
                                     } else {
                                         self.send(
@@ -833,7 +947,7 @@ impl App {
                                     }
                                 }
                                 let trailing_width = if width > 350.0 { 95.0 } else { 40.0 };
-                                let title_width = (ui.available_width() - trailing_width).max(25.0);
+                                let title_width = (ui.available_width() - trailing_width).max(60.0);
                                 ui.allocate_ui_with_layout(
                                     egui::vec2(title_width, 45.0),
                                     Layout::top_down(Align::Min).with_main_align(Align::Center),
@@ -841,15 +955,25 @@ impl App {
                                         ui.set_width(title_width);
                                         ui.spacing_mut().item_spacing.y = 2.0;
                                         let color = if selected { YELLOW } else { Color32::WHITE };
-                                        ui.add(
-                                            egui::Label::new(
-                                                RichText::new(&track.title).strong().color(color),
+                                        let title = ui
+                                            .add(
+                                                egui::Label::new(
+                                                    RichText::new(&track.title)
+                                                        .strong()
+                                                        .color(color),
+                                                )
+                                                .truncate()
+                                                .sense(egui::Sense::click()),
                                             )
-                                            .truncate(),
-                                        );
+                                            .on_hover_text(&track.title);
+                                        if title.clicked() {
+                                            self.detail_track = Some(track.clone());
+                                        }
+                                        self.track_menu(&title, track);
                                         ui.horizontal(|ui| {
                                             ui.spacing_mut().item_spacing.x = 4.0;
-                                            for (index, artist) in track.artists.iter().enumerate() {
+                                            for (index, artist) in track.artists.iter().enumerate()
+                                            {
                                                 if index > 0 {
                                                     ui.label(
                                                         RichText::new("·")
@@ -1001,69 +1125,417 @@ impl App {
     }
 
     fn home(&mut self, ui: &mut egui::Ui, s: &Snapshot) {
-        ui.label(RichText::new("Главная").size(32.0).strong());
-        ui.add_space(8.0);
-        let pending = self.pending.iter().any(|(name, _)| name == "wave_start");
+        let height = (ui.available_height() * 0.80).clamp(310.0, 600.0);
         let (area, _) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width(), 292.0),
+            egui::vec2(ui.available_width(), height),
             egui::Sense::hover(),
         );
         draw_wave(ui, area, s.wave && s.playing);
-        if s.wave && s.playing {
-            ui.ctx().request_repaint_after(Duration::from_millis(33));
-        }
-        let center = area.center();
-        let button_rect =
-            egui::Rect::from_center_size(center - egui::vec2(0.0, 12.0), egui::vec2(197.0, 57.0));
-        let label = if pending {
-            "Запускаем…"
-        } else if s.wave && s.playing {
-            "Ⅱ   Моя волна"
+        let active = s.wave && s.track.is_some();
+        let heading = if active {
+            s.track.as_ref().unwrap().artist()
         } else {
-            "▶   Моя волна"
+            "Моя волна".into()
         };
-        let button = egui::Button::new(
-            RichText::new(label)
-                .size(22.0)
-                .strong()
-                .color(Color32::WHITE),
-        )
-        .fill(Color32::from_rgb(42, 31, 68))
-        .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(128, 108, 177)))
-        .corner_radius(29)
-        .sense(if pending {
-            egui::Sense::hover()
-        } else {
-            egui::Sense::click()
-        });
-        if ui.put(button_rect, button).clicked() && !pending {
-            if !s.logged_in {
-                self.navigate(Page::Settings, false);
-                self.account_status = "Войдите, чтобы запустить Мою волну".into();
-            } else {
-                let command = if !s.wave {
-                    "wave_start"
-                } else if s.playing {
-                    "pause"
-                } else if !s.error.is_empty() {
-                    "wave_start"
-                } else {
-                    "play"
-                };
-                self.send(command, json!({}));
+        let heading_rect = egui::Rect::from_min_max(
+            area.min + egui::vec2(24.0, height * 0.25),
+            egui::pos2(area.right() - 24.0, area.top() + height * 0.57),
+        );
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(heading_rect)
+                .layout(Layout::top_down(Align::Center)),
+            |ui| {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(heading)
+                            .size((area.width() * 0.075).clamp(30.0, 64.0))
+                            .strong()
+                            .color(Color32::WHITE),
+                    )
+                    .wrap(),
+                );
+            },
+        );
+        if active {
+            ui.painter().text(
+                egui::pos2(area.center().x, area.top() + 24.0),
+                egui::Align2::CENTER_CENTER,
+                "МОЯ ВОЛНА",
+                egui::FontId::proportional(13.0),
+                YELLOW,
+            );
+        }
+        let controls = egui::Rect::from_center_size(
+            egui::pos2(area.center().x, area.bottom() - 64.0),
+            egui::vec2(144.0, 52.0),
+        );
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(controls)
+                .layout(Layout::left_to_right(Align::Center)),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = 14.0;
+                ui.add_enabled_ui(active, |ui| {
+                    if control(ui, ControlIcon::Previous, "Предыдущий трек", false).clicked()
+                    {
+                        self.send("previous", json!({}));
+                    }
+                });
+                let pending = self.pending.iter().any(|(name, _)| name == "wave_start");
+                ui.add_enabled_ui(!pending, |ui| {
+                    if control(
+                        ui,
+                        if s.wave && s.playing {
+                            ControlIcon::Pause
+                        } else {
+                            ControlIcon::Play
+                        },
+                        if s.wave && s.playing {
+                            "Пауза"
+                        } else {
+                            "Слушать Мою волну"
+                        },
+                        true,
+                    )
+                    .clicked()
+                    {
+                        if !s.logged_in {
+                            self.navigate(Page::Settings, false);
+                        } else {
+                            self.send(
+                                if !s.wave || !s.error.is_empty() {
+                                    "wave_start"
+                                } else if s.playing {
+                                    "pause"
+                                } else {
+                                    "play"
+                                },
+                                json!({}),
+                            );
+                        }
+                    }
+                });
+                ui.add_enabled_ui(active, |ui| {
+                    if control(ui, ControlIcon::Next, "Следующий трек", false).clicked()
+                    {
+                        self.send("next", json!({}));
+                    }
+                });
+            },
+        );
+        if let Some(track) = s.track.as_ref().filter(|_| active) {
+            let rect = egui::Rect::from_center_size(
+                egui::pos2(area.center().x, area.bottom() - 115.0),
+                egui::vec2((area.width() - 40.0).min(480.0), 24.0),
+            );
+            if ui
+                .put(
+                    rect,
+                    egui::Label::new(RichText::new(&track.title).size(16.0))
+                        .truncate()
+                        .sense(egui::Sense::click()),
+                )
+                .clicked()
+            {
+                self.detail_track = Some(track.clone());
             }
         }
-        ui.painter().text(
-            center + egui::vec2(0.0, 39.0),
-            egui::Align2::CENTER_CENTER,
-            if s.wave {
-                "Ваш персональный поток"
+        ui.advance_cursor_after_rect(area);
+    }
+
+    fn track_menu(&mut self, response: &egui::Response, track: &Track) {
+        if response.secondary_clicked() {
+            self.send("playlists", json!({}));
+        }
+        response.context_menu(|ui| self.track_menu_contents(ui, track));
+    }
+
+    fn more_menu(&mut self, ui: &mut egui::Ui, track: &Track) {
+        let response = control(ui, ControlIcon::More, "Действия с треком", false);
+        if response.clicked() {
+            self.send("playlists", json!({}));
+        }
+        egui::Popup::menu(&response).show(|ui| self.track_menu_contents(ui, track));
+    }
+
+    fn track_menu_contents(&mut self, ui: &mut egui::Ui, track: &Track) {
+        ui.label(&track.title);
+        if ui.button("Открыть трек").clicked() {
+            self.detail_track = Some(track.clone());
+            ui.close();
+        }
+        ui.menu_button("Добавить в плейлист", |ui| {
+            let playlists = self.playlists.clone();
+            for playlist in playlists.iter().filter(|p| p.id != "3") {
+                if ui.button(&playlist.title).clicked() {
+                    self.send(
+                        "playlist_add",
+                        json!({"playlist_id":playlist.id,"track_id":track.id}),
+                    );
+                    ui.close();
+                }
+            }
+            if playlists.is_empty() {
+                ui.label("Загружаем ваши плейлисты…");
+            }
+            ui.separator();
+            if ui.button("Создать новый плейлист…").clicked() {
+                self.create_track = Some(track.clone());
+                self.playlist_title.clear();
+                self.playlist_dialog = true;
+                ui.close();
+            }
+        });
+    }
+
+    fn track_like(&mut self, ui: &mut egui::Ui, s: &Snapshot, track: &Track) {
+        let liked = s.liked.contains(&track.id);
+        if control(
+            ui,
+            ControlIcon::Like,
+            if liked {
+                "Убрать из любимого"
             } else {
-                "Музыка под ваше настроение"
+                "Добавить в любимое"
             },
-            egui::FontId::proportional(14.0),
-            Color32::from_rgb(222, 213, 238),
-        );
+            liked,
+        )
+        .clicked()
+        {
+            self.send(
+                if liked { "unlike" } else { "like" },
+                json!({"track_id":track.id}),
+            );
+        }
+    }
+
+    fn recommendation_cards(&mut self, ui: &mut egui::Ui, s: &Snapshot) {
+        ui.add_space(16.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Хочу рекомендации").size(22.0).strong());
+            if ui.button("Обновить волну").clicked() {
+                self.send("wave_start", json!({}));
+            }
+        });
+        if s.queue.is_empty() {
+            ui.label("Запустите Мою волну — здесь появятся треки для вас.");
+            return;
+        }
+        ScrollArea::horizontal()
+            .id_salt("recommendations")
+            .show(ui, |ui| {
+                ui.horizontal_top(|ui| {
+                    for (index, track) in s
+                        .queue
+                        .iter()
+                        .enumerate()
+                        .skip(s.index.unwrap_or(0))
+                        .take(8)
+                    {
+                        let response = Frame::new()
+                            .fill(Color32::from_rgb(29, 28, 35))
+                            .corner_radius(16)
+                            .inner_margin(12)
+                            .show(ui, |ui| {
+                                ui.vertical(|ui| {
+                                    ui.set_width(156.0);
+                                    let cover = self.covers.draw(ui, track.cover(), 156.0);
+                                    if cover.clicked() {
+                                        self.detail_track = Some(track.clone());
+                                    }
+                                    self.track_menu(&cover, track);
+                                    let title = ui
+                                        .add_sized(
+                                            [156.0, 22.0],
+                                            egui::Label::new(RichText::new(&track.title).strong())
+                                                .truncate()
+                                                .sense(egui::Sense::click()),
+                                        )
+                                        .on_hover_text(&track.title);
+                                    if title.clicked() {
+                                        self.detail_track = Some(track.clone());
+                                    }
+                                    self.track_menu(&title, track);
+                                    ui.add_sized(
+                                        [156.0, 20.0],
+                                        egui::Label::new(track.artist()).truncate(),
+                                    )
+                                    .on_hover_text(track.artist());
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 10.0;
+                                        ui.add_space(10.0);
+                                        let active =
+                                            s.track.as_ref().is_some_and(|t| t.id == track.id);
+                                        let playing = active && s.playing;
+                                        if control(
+                                            ui,
+                                            if playing {
+                                                ControlIcon::Pause
+                                            } else {
+                                                ControlIcon::Play
+                                            },
+                                            if playing {
+                                                "Пауза"
+                                            } else {
+                                                "Играть"
+                                            },
+                                            active,
+                                        )
+                                        .clicked()
+                                        {
+                                            self.send(
+                                                if active {
+                                                    if playing { "pause" } else { "play" }
+                                                } else {
+                                                    "queue_play"
+                                                },
+                                                json!({"index":index}),
+                                            );
+                                        }
+                                        self.track_like(ui, s, track);
+                                        self.more_menu(ui, track);
+                                    });
+                                });
+                            })
+                            .response;
+                        self.track_menu(&response, track);
+                    }
+                });
+            });
+    }
+
+    fn track_detail(&mut self, ui: &mut egui::Ui, s: &Snapshot, track: &Track) {
+        let area = ui.max_rect();
+        let color = self.covers.palette(track.cover());
+        let phase = ui.input(|i| i.time) as f32 * 0.25;
+        let mut mesh = egui::Mesh::default();
+        let shade = |factor: f32| {
+            Color32::from_rgb(
+                (color.r() as f32 * factor) as u8,
+                (color.g() as f32 * factor) as u8,
+                (color.b() as f32 * factor) as u8,
+            )
+        };
+        for (pos, factor) in [
+            (area.left_top(), 0.35 + 0.15 * phase.sin()),
+            (area.right_top(), 0.7 + 0.2 * phase.cos()),
+            (area.right_bottom(), 0.3),
+            (area.left_bottom(), 0.65 - 0.2 * phase.cos()),
+        ] {
+            mesh.colored_vertex(pos, shade(factor));
+        }
+        mesh.add_triangle(0, 1, 2);
+        mesh.add_triangle(0, 2, 3);
+        ui.painter().add(egui::Shape::mesh(mesh));
+        ui.ctx().request_repaint_after(Duration::from_millis(66));
+        ScrollArea::vertical().show(ui, |ui| {
+            if ui.button("← Назад").clicked() {
+                self.detail_track = None;
+            }
+            ui.vertical_centered(|ui| {
+                let size = (area.height() - 190.0)
+                    .clamp(120.0, 360.0)
+                    .min(ui.available_width() - 30.0);
+                let cover = self.covers.draw(ui, track.cover(), size);
+                self.track_menu(&cover, track);
+                ui.add_space(14.0);
+                ui.label(RichText::new(&track.title).size(28.0).strong());
+                ui.label(RichText::new(track.artist()).size(18.0));
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 12.0;
+                    ui.add_space(((ui.available_width() - 236.0) * 0.5).max(0.0));
+                    self.track_like(ui, s, track);
+                    if control(ui, ControlIcon::Previous, "Предыдущий трек", false).clicked()
+                    {
+                        self.send("previous", json!({}));
+                    }
+                    let active = s.track.as_ref().is_some_and(|t| t.id == track.id);
+                    if control(
+                        ui,
+                        if active && s.playing {
+                            ControlIcon::Pause
+                        } else {
+                            ControlIcon::Play
+                        },
+                        if active && s.playing {
+                            "Пауза"
+                        } else {
+                            "Слушать"
+                        },
+                        true,
+                    )
+                    .clicked()
+                    {
+                        self.send(
+                            if active {
+                                if s.playing { "pause" } else { "play" }
+                            } else {
+                                "play_track"
+                            },
+                            json!({"track_id":track.id}),
+                        );
+                    }
+                    if control(ui, ControlIcon::Next, "Следующий трек", false).clicked()
+                    {
+                        self.send("next", json!({}));
+                    }
+                    self.more_menu(ui, track);
+                });
+            });
+        });
+    }
+
+    fn playlist_create_dialog(&mut self, ctx: &Context) {
+        if !self.playlist_dialog {
+            return;
+        }
+        let busy = self
+            .pending
+            .iter()
+            .any(|(name, _)| name == "playlist_create");
+        egui::Modal::new(egui::Id::new("create-playlist-modal")).show(ctx, |ui| {
+            ui.set_width((ctx.content_rect().width() - 64.0).clamp(240.0, 360.0));
+            ui.heading("Новый плейлист");
+            ui.add_space(16.0);
+            ui.label("Название");
+            ui.add_sized(
+                [ui.available_width(), 36.0],
+                TextEdit::singleline(&mut self.playlist_title)
+                    .hint_text("Например, В дороге")
+                    .char_limit(100)
+                    .margin(egui::vec2(10.0, 8.0)),
+            );
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new("Личный плейлист. Выбранный трек добавится автоматически.")
+                    .size(12.0)
+                    .color(Color32::from_gray(155)),
+            );
+            ui.add_space(18.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        !busy && !self.playlist_title.trim().is_empty(),
+                        primary(if busy {
+                            "Создаём…"
+                        } else {
+                            "Создать"
+                        }),
+                    )
+                    .clicked()
+                {
+                    self.send(
+                        "playlist_create",
+                        json!({"title":self.playlist_title.trim()}),
+                    );
+                }
+                if ui.button("Отмена").clicked() {
+                    self.playlist_dialog = false;
+                }
+            });
+        });
     }
 
     fn transport(&mut self, ui: &mut egui::Ui, s: &Snapshot) {
@@ -1143,8 +1615,15 @@ impl App {
     }
 
     fn track_info(&mut self, ui: &mut egui::Ui, s: &Snapshot, width: f32) {
-        self.covers
+        let cover = self
+            .covers
             .draw(ui, s.track.as_ref().and_then(Track::cover), 42.0);
+        if let Some(track) = &s.track {
+            if cover.clicked() {
+                self.detail_track = Some(track.clone());
+            }
+            self.track_menu(&cover, track);
+        }
         let title = s
             .track
             .as_ref()
@@ -1165,7 +1644,17 @@ impl App {
             |ui| {
                 ui.set_width((width - 52.0).max(60.0));
                 ui.spacing_mut().item_spacing.y = 2.0;
-                ui.add(egui::Label::new(RichText::new(title).strong()).truncate());
+                let title = ui.add(
+                    egui::Label::new(RichText::new(title).strong())
+                        .truncate()
+                        .sense(egui::Sense::click()),
+                );
+                if let Some(track) = &s.track {
+                    if title.clicked() {
+                        self.detail_track = Some(track.clone());
+                    }
+                    self.track_menu(&title, track);
+                }
                 let artist = s
                     .track
                     .as_ref()
@@ -1180,34 +1669,19 @@ impl App {
                     .truncate()
                     .sense(egui::Sense::click()),
                 );
-                if let Some(artist) = artist {
-                    if subtitle.on_hover_text("Об исполнителе").clicked() {
-                        self.open_artist(artist.id, &artist.name);
-                    }
+                if let Some(artist) = artist
+                    && subtitle.on_hover_text("Об исполнителе").clicked()
+                {
+                    self.open_artist(artist.id, &artist.name);
                 }
             },
         );
     }
 
-    fn likes(&mut self, ui: &mut egui::Ui, s: &Snapshot, reversed: bool) {
-        let choices = if reversed {
-            [
-                (ControlIcon::Unlike, "Убрать из любимого", "unlike"),
-                (ControlIcon::Like, "Добавить в любимое", "like"),
-            ]
-        } else {
-            [
-                (ControlIcon::Like, "Добавить в любимое", "like"),
-                (ControlIcon::Unlike, "Убрать из любимого", "unlike"),
-            ]
-        };
-        ui.add_enabled_ui(s.track.is_some(), |ui| {
-            for (icon, label, command) in choices {
-                if control(ui, icon, label, false).clicked() {
-                    self.send(command, json!({}));
-                }
-            }
-        });
+    fn likes(&mut self, ui: &mut egui::Ui, s: &Snapshot, _reversed: bool) {
+        if let Some(track) = &s.track {
+            self.track_like(ui, s, track);
+        }
     }
 
     fn playback_buttons(&mut self, ui: &mut egui::Ui, s: &Snapshot) {
@@ -1265,8 +1739,14 @@ impl App {
         if control(ui, mini_icon, mini_label, self.mini).clicked() {
             self.mini = !self.mini;
             ui.ctx()
+                .send_viewport_cmd(ViewportCommand::MinInnerSize(if self.mini {
+                    egui::vec2(560.0, 210.0)
+                } else {
+                    egui::vec2(560.0, 480.0)
+                }));
+            ui.ctx()
                 .send_viewport_cmd(ViewportCommand::InnerSize(if self.mini {
-                    egui::vec2(550.0, 190.0)
+                    egui::vec2(560.0, 210.0)
                 } else {
                     egui::vec2(1060.0, 710.0)
                 }));
@@ -1402,9 +1882,19 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        #[cfg(windows)]
+        {
+            if self.tray.is_some()
+                && !self.quitting
+                && ctx.input(|i| i.viewport().close_requested())
+            {
+                ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+                ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+            }
+        }
         self.poll();
         self.covers.poll(ctx);
-        let snapshot = self.state.lock().unwrap().clone();
+        let snapshot = self.state.lock().unwrap_or_else(|e| e.into_inner()).clone();
         self.flush_volume(&snapshot);
         let search_shortcut = ctx.input(|input| {
             input.events.iter().any(|event| {
@@ -1462,7 +1952,8 @@ impl eframe::App for App {
                     .truncate(),
                 );
             });
-        if !self.mini {
+        self.playlist_create_dialog(ctx);
+        if !self.mini && self.detail_track.is_none() {
             self.nav(ctx, &snapshot);
         }
         egui::CentralPanel::default()
@@ -1471,11 +1962,21 @@ impl eframe::App for App {
                 if self.mini {
                     return;
                 }
+                if let Some(track) = self.detail_track.clone() {
+                    self.track_detail(ui, &snapshot, &track);
+                    return;
+                }
                 match self.page {
-                    Page::Home => self.home(ui, &snapshot),
+                    Page::Home => {
+                        ScrollArea::vertical().show(ui, |ui| {
+                            self.home(ui, &snapshot);
+                            self.recommendation_cards(ui, &snapshot);
+                        });
+                    }
                     Page::Search => self.search_page(ui, &snapshot),
                     Page::Library => {
                         ui.heading("Любимое");
+                        ui.small("Последние 100 любимых треков");
                         if snapshot.logged_in {
                             if ui.button("Обновить").clicked() {
                                 self.send("library", json!({}));
@@ -1496,8 +1997,7 @@ impl eframe::App for App {
                             if ui.button("Обновить").clicked() {
                                 self.send("playlists", json!({}));
                             }
-                            let loading =
-                                self.pending.iter().any(|(name, _)| name == "playlists");
+                            let loading = self.pending.iter().any(|(name, _)| name == "playlists");
                             if loading {
                                 ui.horizontal(|ui| {
                                     ui.spinner();
@@ -1512,8 +2012,7 @@ impl eframe::App for App {
                                 let playlists = self.playlists.clone();
                                 for playlist in &playlists {
                                     ui.horizontal(|ui| {
-                                        self.covers
-                                            .draw(ui, playlist.cover_uri.as_deref(), 40.0);
+                                        self.covers.draw(ui, playlist.cover_uri.as_deref(), 40.0);
                                         ui.vertical(|ui| {
                                             if ui
                                                 .add(
@@ -1752,7 +2251,7 @@ enum ControlIcon {
     Expand,
     Equalizer,
     Like,
-    Unlike,
+    More,
 }
 
 fn time_label(ui: &mut egui::Ui, seconds: f64) {
@@ -1833,6 +2332,11 @@ fn paint_control(painter: &egui::Painter, center: egui::Pos2, color: Color32, ic
         ));
     };
     match icon {
+        ControlIcon::More => {
+            for x in [-5.5, 0.0, 5.5] {
+                painter.circle_filled(p(x, 0.0), 1.6, color);
+            }
+        }
         ControlIcon::Play => triangle([(-5.0, -8.0), (8.0, 0.0), (-5.0, 8.0)]),
         ControlIcon::Pause => {
             rect(-6.0, -8.0, -2.0, 8.0, 1);
@@ -1880,7 +2384,7 @@ fn paint_control(painter: &egui::Painter, center: egui::Pos2, color: Color32, ic
                 painter.circle_stroke(p(x, y), 1.8, stroke);
             }
         }
-        ControlIcon::Like | ControlIcon::Unlike => {
+        ControlIcon::Like => {
             line(&[
                 (0.0, 7.0),
                 (-6.9, 0.5),
@@ -1896,61 +2400,66 @@ fn paint_control(painter: &egui::Painter, center: egui::Pos2, color: Color32, ic
                 (6.9, 0.5),
                 (0.0, 7.0),
             ]);
-            if matches!(icon, ControlIcon::Unlike) {
-                line(&[(-2.9, -0.5), (2.9, -0.5)]);
-            }
         }
     }
 }
 
 fn draw_wave(ui: &egui::Ui, rect: egui::Rect, playing: bool) {
     let painter = ui.painter().with_clip_rect(rect);
-    let center = rect.center();
-    painter.rect_filled(rect, 20, Color32::from_rgb(23, 17, 40));
-    let rx = (rect.width() * 0.42).min(340.0);
-    let ry = rect.height() * 0.43;
-    for layer in (1..=18).rev() {
-        let t = layer as f32 / 18.0;
-        let points = (0..64)
-            .map(|i| {
-                let a = i as f32 * std::f32::consts::TAU / 64.0;
-                center + egui::vec2(a.cos() * rx * t, a.sin() * ry * t)
-            })
-            .collect();
-        painter.add(egui::Shape::convex_polygon(
-            points,
-            Color32::from_rgba_unmultiplied(81, 45, 157, 11),
-            egui::Stroke::NONE,
-        ));
-    }
-    let phase = if playing {
-        ui.input(|input| input.time) as f32 * 1.15
+    painter.rect_filled(rect, 20, Color32::from_rgb(8, 8, 10));
+    let t = if playing {
+        ui.input(|i| i.time) as f32 * 0.22
     } else {
         0.0
     };
-    for strand in 0..19 {
-        let offset = strand as f32 * 0.19;
-        let points = (0..=150)
-            .map(|i| {
-                let a = i as f32 * std::f32::consts::TAU / 150.0;
-                let ripple = (a * 3.0 + offset + phase).sin() * 0.095
-                    + (a * 6.0 - phase * 0.6 + offset * 1.7).sin() * 0.045;
-                let radius = 0.58 + strand as f32 * 0.014 + ripple;
-                center + egui::vec2(a.cos() * rx * radius, a.sin() * ry * radius)
-            })
-            .collect();
-        let color = if strand % 4 == 0 {
-            (108, 182, 255)
-        } else {
-            (171, 122, 255)
-        };
-        painter.add(egui::Shape::line(
-            points,
-            egui::Stroke::new(
-                1.1_f32,
-                Color32::from_rgba_unmultiplied(color.0, color.1, color.2, 90),
-            ),
-        ));
+    for (offset, color, scale) in [
+        (
+            egui::vec2(-0.12, 0.02),
+            Color32::from_rgb(205, 155, 0),
+            0.48,
+        ),
+        (
+            egui::vec2(0.17, -0.08),
+            Color32::from_rgb(155, 15, 118),
+            0.40,
+        ),
+        (egui::vec2(0.04, 0.08), Color32::from_rgb(232, 190, 0), 0.30),
+    ] {
+        let center = rect.center()
+            + egui::vec2(
+                (offset.x + 0.035 * t.sin()) * rect.width(),
+                (offset.y + 0.035 * t.cos()) * rect.height(),
+            );
+        let radius = egui::vec2(rect.width() * scale, rect.height() * scale * 1.3);
+        let mut mesh = egui::Mesh::default();
+        for ring in 0..=12 {
+            let r = ring as f32 / 12.0;
+            let alpha = ((1.0 - r * r).max(0.0).powi(2) * 145.0) as u8;
+            for step in 0..48 {
+                let angle = step as f32 * std::f32::consts::TAU / 48.0;
+                let wobble = 1.0 + 0.1 * (angle * 3.0 + t).sin();
+                mesh.colored_vertex(
+                    center
+                        + egui::vec2(
+                            angle.cos() * radius.x * r * wobble,
+                            angle.sin() * radius.y * r * wobble,
+                        ),
+                    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha),
+                );
+            }
+        }
+        for ring in 0..12u32 {
+            for step in 0..48u32 {
+                let a = ring * 48 + step;
+                let b = ring * 48 + (step + 1) % 48;
+                mesh.add_triangle(a, b, a + 48);
+                mesh.add_triangle(b, b + 48, a + 48);
+            }
+        }
+        painter.add(egui::Shape::mesh(mesh));
+    }
+    if playing {
+        ui.ctx().request_repaint_after(Duration::from_millis(100));
     }
 }
 
@@ -2070,5 +2579,143 @@ mod tests {
             shortcut_command(true, true, Some(Key::ArrowRight), &loading).is_none(),
             "пока грузится трек, перемотка недоступна"
         );
+    }
+}
+
+#[cfg(test)]
+mod card_layout_tests {
+    #[test]
+    fn short_navigation_scrolls_without_overlapping_settings_and_queue() {
+        let ctx = Context::default();
+        let mut app = App::new_internal(&ctx, false);
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(560.0, 300.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| app.nav(ctx, &Snapshot::default()),
+        );
+        let mut texts = vec![];
+        for shape in output.shapes {
+            text_shapes(&shape.shape, &mut texts);
+        }
+        let labels = [
+            "Главная",
+            "Поиск",
+            "Любимое",
+            "Плейлисты",
+            "Очередь",
+            "Настройки",
+        ];
+        let visible: Vec<_> = texts
+            .iter()
+            .filter(|t| labels.contains(&t.0.as_str()))
+            .collect();
+        assert!(visible.len() >= 3);
+        for (i, a) in visible.iter().enumerate() {
+            for b in &visible[i + 1..] {
+                assert!(!a.2.intersects(b.2), "{} overlaps {}", a.0, b.0);
+            }
+        }
+    }
+    #[test]
+    fn detail_play_button_stays_in_the_center_of_the_page() {
+        let ctx = Context::default();
+        let mut app = App::new_internal(&ctx, false);
+        let track: Track = serde_json::from_value(
+            json!({"id":42,"title":"Test song","artists":[{"id":1,"name":"Test artist"}]}),
+        )
+        .unwrap();
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .show(ctx, |ui| app.track_detail(ui, &Snapshot::default(), &track));
+            },
+        );
+        let play = output
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::Shape::Circle(c) if c.fill == YELLOW && c.radius == 22.0 => Some(c.center),
+                _ => None,
+            })
+            .expect("vector play button");
+        assert!(
+            (play.x - 400.0).abs() < 3.0,
+            "play is centered, got {}",
+            play.x
+        );
+    }
+
+    use super::*;
+    fn text_shapes(shape: &egui::Shape, output: &mut Vec<(String, bool, egui::Rect)>) {
+        match shape {
+            egui::Shape::Text(text) => output.push((
+                text.galley.job.text.clone(),
+                text.galley.elided,
+                text.galley.rect.translate(text.pos.to_vec2()),
+            )),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    text_shapes(shape, output);
+                }
+            }
+            _ => {}
+        }
+    }
+    #[test]
+    fn recommendation_keeps_title_and_artist_below_cover_at_minimum_width() {
+        let ctx = Context::default();
+        let mut app = App::new_internal(&ctx, false);
+        let track: Track = serde_json::from_value(json!({"id":42,"title":"Test song","artists":[{"id":1,"name":"Test artist"}],"durationMs":120000})).unwrap();
+        let snapshot = Snapshot {
+            queue: vec![track],
+            index: Some(0),
+            ..Default::default()
+        };
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(320.0, 480.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .show(ctx, |ui| app.recommendation_cards(ui, &snapshot));
+            },
+        );
+        let mut texts = vec![];
+        for shape in output.shapes {
+            text_shapes(&shape.shape, &mut texts);
+        }
+        let title = texts
+            .iter()
+            .find(|t| t.0 == "Test song")
+            .expect("title is rendered");
+        let artist = texts
+            .iter()
+            .find(|t| t.0 == "Test artist")
+            .expect("artist is rendered");
+        assert!(
+            !title.1 && !artist.1,
+            "short metadata must not collapse into ellipsis"
+        );
+        assert!(
+            artist.2.top() >= title.2.bottom(),
+            "artist belongs on its own line"
+        );
+        assert!(title.2.width() > 30.0);
     }
 }

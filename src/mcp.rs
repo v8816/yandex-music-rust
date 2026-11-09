@@ -202,9 +202,10 @@ impl Bridge {
     }
 
     pub fn config(&self) -> Result<Value> {
-        let exe = std::env::current_exe()?.with_file_name("yandex-music-mcp.exe");
+        let exe = std::env::current_exe()?;
         Ok(json!({"mcpServers":{"yandex-music":{
-            "command": exe, "args": [self.port.to_string(), self.token]
+            "command": exe, "args": ["--mcp", self.port.to_string()],
+            "env": {"YANDEX_MUSIC_MCP_KEY": self.token}
         }}}))
     }
 }
@@ -305,15 +306,10 @@ pub fn stdio(port: u16, token: &str) -> Result<()> {
         let result = match method {
             "initialize" => {
                 initialized = true;
-                let version = match request
+                let version = request
                     .pointer("/params/protocolVersion")
                     .and_then(Value::as_str)
-                {
-                    Some(version @ ("2025-11-25" | "2025-06-18" | "2025-03-26" | "2024-11-05")) => {
-                        version
-                    }
-                    _ => "2025-11-25",
-                };
+                    .unwrap_or("2025-11-25");
                 json!({"protocolVersion":version,"serverInfo":{"name":"yandex-music-rust","version":env!("CARGO_PKG_VERSION")},"capabilities":{"tools":{}}})
             }
             "ping" => json!({}),
