@@ -2,7 +2,11 @@
 name = "yandex-music-rust"
 version = "0.2.0"
 edition = "2024"
-description = "Нативный клиент Яндекс Музыки на Rust: egui, rodio и MCP"
+autobins = false
+
+[[bin]]
+name = "yandex-music-rust"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
@@ -22,6 +26,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 rodio = { version = "0.21.1", default-features = false, features = ["wav"] }
 
 [target.'cfg(windows)'.dependencies]
+tray-icon = "0.21"
 windows = { version = "0.54", features = [
     "Win32_Foundation",
     "Win32_Security_Credentials",
@@ -29,6 +34,9 @@ windows = { version = "0.54", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[build-dependencies]
+winresource = "0.1"
 
 [profile.release]
 lto = "thin"

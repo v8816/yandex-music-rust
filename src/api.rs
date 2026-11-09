@@ -187,10 +187,7 @@ fn playlists_from_items(items: Vec<Value>) -> Vec<Playlist> {
                 .map(|n| n.to_string())
                 .or_else(|| item["id"].as_str().map(str::to_owned))
                 .unwrap_or_default(),
-            title: item["title"]
-                .as_str()
-                .unwrap_or("Без названия")
-                .to_owned(),
+            title: item["title"].as_str().unwrap_or("Без названия").to_owned(),
             owner: item
                 .pointer("/owner/name")
                 .and_then(Value::as_str)
@@ -252,7 +249,9 @@ fn service_error(status: reqwest::StatusCode, body: &Value) -> String {
     let message = body.pointer("/error/message").and_then(Value::as_str);
     let message = message.map(|message| message.chars().take(200).collect::<String>());
     match (name, message) {
-        (Some(name), Some(message)) => format!("Яндекс Музыка вернула HTTP {status}: {name} — {message}"),
+        (Some(name), Some(message)) => {
+            format!("Яндекс Музыка вернула HTTP {status}: {name} — {message}")
+        }
         (None, Some(message)) => format!("Яндекс Музыка вернула HTTP {status}: {message}"),
         _ => format!("Яндекс Музыка вернула HTTP {status}"),
     }
@@ -336,6 +335,7 @@ impl Api {
     }
 
     pub fn wave_more(&self, session: &str, queue: Vec<String>) -> Result<WaveBatch> {
+        ensure!(valid_session(session), "Некорректный номер сессии");
         let batch = self.wave_request(
             &format!("rotor/session/{session}/tracks"),
             json!({"queue":&queue}),
@@ -367,6 +367,9 @@ impl Api {
     }
 
     pub fn wave_feedback(&self, session: &str, event: &Value) {
+        if !valid_session(session) {
+            return;
+        }
         let _ = self
             .request(
                 reqwest::Method::POST,
@@ -414,11 +417,15 @@ impl Api {
             "search",
             &[("text", query), ("type", "track"), ("page", "0")],
         )?;
-        Ok(serde_json::from_value(
+        let tracks: Vec<Track> = serde_json::from_value(
             v.pointer("/tracks/results")
                 .cloned()
                 .unwrap_or(Value::Array(vec![])),
-        )?)
+        )?;
+        Ok(tracks
+            .into_iter()
+            .filter(|track| track.available != Some(false))
+            .collect())
     }
 
     pub fn track(&self, id: u64) -> Result<Track> {
@@ -540,21 +547,22 @@ impl Api {
 
     pub fn playlists(&self) -> Result<Vec<Playlist>> {
         let uid = self.uid.context("Сначала войдите в аккаунт")?;
-        if let Ok(body) = self.get_with_timeout(&format!("users/{uid}/playlists/list"), &[], LONG_TIMEOUT)
+        if let Ok(body) =
+            self.get_with_timeout(&format!("users/{uid}/playlists/list"), &[], LONG_TIMEOUT)
+            && (body.get("playlists").is_some() || body.is_array())
         {
-            if body.get("playlists").is_some() || body.is_array() {
-                return Ok(playlists_from_items(list_items(&body, "playlists")));
-            }
+            return Ok(playlists_from_items(list_items(&body, "playlists")));
         }
-        let kinds = kinds_from(
-            &self.get(&format!("users/{uid}/playlists/list/kinds"), &[])?,
-        );
+        let kinds = kinds_from(&self.get(&format!("users/{uid}/playlists/list/kinds"), &[])?);
         if kinds.is_empty() {
             return Ok(vec![]);
         }
         let response = self
             .request(reqwest::Method::POST, &format!("users/{uid}/playlists"))
-            .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
             .body(kinds_form(&kinds))
             .send()
             .context("Не удалось получить плейлисты")?;
@@ -591,7 +599,11 @@ impl Api {
         let items = list_items(&body, "tracks");
         let likes = likes || body.pointer("/kind").and_then(Value::as_u64) == Some(3);
         if items.is_empty() {
-            return if likes { self.liked_tracks() } else { Ok(vec![]) };
+            return if likes {
+                self.liked_tracks()
+            } else {
+                Ok(vec![])
+            };
         }
         let mut tracks = Vec::with_capacity(items.len());
         let mut missing = Vec::new();
@@ -779,6 +791,14 @@ impl Api {
     }
 }
 
+fn valid_session(session: &str) -> bool {
+    !session.is_empty()
+        && session.len() <= 512
+        && session
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -885,11 +905,12 @@ mod tests {
         let mut api = Api::new().unwrap();
         api.uid = Some(103_372_440);
         let playlists = api.playlists().unwrap();
-        assert!(!playlists.is_empty(), "список плейлистов не должен быть пустым");
         assert!(
-            playlists
-                .iter()
-                .all(|playlist| !playlist.title.is_empty()),
+            !playlists.is_empty(),
+            "список плейлистов не должен быть пустым"
+        );
+        assert!(
+            playlists.iter().all(|playlist| !playlist.title.is_empty()),
             "у каждого плейлиста должно быть название"
         );
         let playlist = playlists
@@ -905,7 +926,11 @@ mod tests {
             .map(|track| track.id)
             .collect::<Vec<_>>();
         let hydrated = api.tracks_by_ids(&ids).unwrap();
-        assert_eq!(hydrated.len(), ids.len(), "треки добираются по идентификаторам");
+        assert_eq!(
+            hydrated.len(),
+            ids.len(),
+            "треки добираются по идентификаторам"
+        );
         assert!(hydrated.iter().all(|track| !track.title.is_empty()));
     }
 
@@ -915,7 +940,10 @@ mod tests {
         let api = Api::new().unwrap();
         let info = api.artist(13_905).unwrap();
         assert_eq!(info.name, "Daft Punk");
-        assert!(!info.description.is_empty(), "описание исполнителя приходит");
+        assert!(
+            !info.description.is_empty(),
+            "описание исполнителя приходит"
+        );
         assert!(info.cover_uri.is_some(), "обложка исполнителя приходит");
         assert!(info.listeners > 0, "статистика приходит");
         assert!(!info.tracks.is_empty(), "треки исполнителя приходят");
@@ -937,5 +965,16 @@ mod tests {
                 .iter()
                 .any(|next| tracks.iter().all(|old| old.id != next.id))
         );
+    }
+}
+
+#[cfg(test)]
+mod session_validation_tests {
+    #[test]
+    fn session_cannot_change_endpoint() {
+        for value in ["", "../account", "id?x=1", "a/b", "a#b", "a%2fb"] {
+            assert!(!super::valid_session(value));
+        }
+        assert!(super::valid_session("abc-123_DEF"));
     }
 }

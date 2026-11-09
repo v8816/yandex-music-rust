@@ -1,6 +1,7 @@
 mod api;
 mod auth;
 mod covers;
+mod desktop;
 mod equalizer;
 pub mod mcp;
 mod media;

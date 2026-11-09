@@ -2,7 +2,7 @@ name: build
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, "dev/**"]
   pull_request:
   workflow_dispatch:
 
@@ -13,6 +13,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
       - name: Тесты
         run: cargo test --locked
       - name: Сборка
@@ -22,5 +24,4 @@ jobs:
           name: yandex-music-rust-windows-x64
           path: |
             target/release/yandex-music-rust.exe
-            target/release/yandex-music-mcp.exe
           if-no-files-found: error

@@ -1,4 +1,3 @@
-
 use crate::player::{Job, Snapshot};
 use serde_json::json;
 use std::sync::{Arc, mpsc::SyncSender};
@@ -12,8 +11,9 @@ mod platform {
     use crate::player;
     use std::{
         sync::{
+            Mutex,
             atomic::{AtomicBool, Ordering},
-            mpsc, Mutex,
+            mpsc,
         },
         thread,
     };
@@ -132,13 +132,17 @@ mod platform {
             let message = wparam.0;
             if message == WM_KEYDOWN as usize || message == WM_SYSKEYDOWN as usize {
                 let info = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
-                if let Ok(guard) = HOOK.lock() {
-                    if let Some(shared) = guard.as_ref() {
-                        if let Some(command) = media_key_command(info.vkCode, &shared.state) {
-                            let _ = player::submit(&shared.tx, command, json!({}));
-                            return LRESULT(1);
-                        }
-                    }
+                if let Ok(guard) = HOOK.lock()
+                    && let Some(shared) = guard.as_ref()
+                    && shared
+                        .state
+                        .lock()
+                        .map(|s| s.playing || s.loading)
+                        .unwrap_or(false)
+                    && let Some(command) = media_key_command(info.vkCode, &shared.state)
+                {
+                    let _ = player::submit(&shared.tx, command, json!({}));
+                    return LRESULT(1);
                 }
             }
         }
@@ -254,7 +258,10 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         let again = again.expect("после освобождения клавиши снова доступны");
-        assert!(!again.uses_hook(), "клавиши снова берутся горячими клавишами");
+        assert!(
+            !again.uses_hook(),
+            "клавиши снова берутся горячими клавишами"
+        );
     }
 
     #[test]
@@ -317,11 +324,6 @@ mod tests {
     }
 
     fn current(state: &Arc<Mutex<Snapshot>>) -> Option<u64> {
-        state
-            .lock()
-            .unwrap()
-            .track
-            .as_ref()
-            .map(|track| track.id)
+        state.lock().unwrap().track.as_ref().map(|track| track.id)
     }
 }

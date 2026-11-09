@@ -1,4 +1,3 @@
-
 use crate::api::{Api, Track};
 use std::{
     collections::VecDeque,
@@ -62,6 +61,7 @@ struct Cached {
 
 pub struct Loader {
     requests: Sender<Request>,
+    prefetches: mpsc::SyncSender<Request>,
     loaded: Receiver<Loaded>,
     latest: Arc<AtomicU64>,
     generation: u64,
@@ -72,10 +72,16 @@ impl Loader {
         let (requests, incoming) = mpsc::channel::<Request>();
         let (results, loaded) = mpsc::channel::<Loaded>();
         let latest = Arc::new(AtomicU64::new(0));
+        let cache = Arc::new(std::sync::Mutex::new(VecDeque::new()));
         let cancelled = latest.clone();
-        thread::spawn(move || run(incoming, results, cancelled));
+        let foreground_cache = cache.clone();
+        thread::spawn(move || run(incoming, results, cancelled, foreground_cache));
+        let (prefetches, pending) = mpsc::sync_channel(1);
+        let cancelled = latest.clone();
+        thread::spawn(move || prefetch_worker(pending, cancelled, cache));
         Self {
             requests,
+            prefetches,
             loaded,
             latest,
             generation: 0,
@@ -95,7 +101,7 @@ impl Loader {
     }
 
     pub fn prefetch(&self, api: &Api, track: &Track, lossless: bool) {
-        let _ = self.requests.send(Request::Prefetch {
+        let _ = self.prefetches.try_send(Request::Prefetch {
             api: api.clone(),
             track: track.clone(),
             lossless,
@@ -113,8 +119,9 @@ impl Loader {
     }
 }
 
-fn run(incoming: Receiver<Request>, loaded: Sender<Loaded>, latest: Arc<AtomicU64>) {
-    let mut cache: VecDeque<Cached> = VecDeque::new();
+type Cache = Arc<std::sync::Mutex<VecDeque<Cached>>>;
+
+fn run(incoming: Receiver<Request>, loaded: Sender<Loaded>, latest: Arc<AtomicU64>, cache: Cache) {
     while let Ok(first) = incoming.recv() {
         let mut play = None;
         let mut prefetches = Vec::new();
@@ -138,7 +145,11 @@ fn run(incoming: Receiver<Request>, loaded: Sender<Loaded>, latest: Arc<AtomicU6
             }
         }
         if let Some((api, track, lossless, generation)) = play {
-            if let Some(cached) = take(&mut cache, track.id, lossless) {
+            if let Some(cached) = take(
+                &mut cache.lock().unwrap_or_else(|e| e.into_inner()),
+                track.id,
+                lossless,
+            ) {
                 let _ = loaded.send(Loaded::Audio {
                     generation,
                     bytes: cached.bytes,
@@ -160,31 +171,36 @@ fn run(incoming: Receiver<Request>, loaded: Sender<Loaded>, latest: Arc<AtomicU6
                 }
             }
         }
-        for (api, track, lossless) in prefetches {
-            if cache
-                .iter()
-                .any(|cached| cached.track == track.id && cached.lossless == lossless)
-            {
+    }
+}
+
+fn prefetch_worker(incoming: Receiver<Request>, latest: Arc<AtomicU64>, cache: Cache) {
+    while let Ok(Request::Prefetch {
+        api,
+        track,
+        lossless,
+    }) = incoming.recv()
+    {
+        let mark = latest.load(Ordering::Relaxed);
+        let cancelled = latest.clone();
+        if let Ok(Some((bytes, codec))) = api.audio_while(track.id, lossless, move || {
+            cancelled.load(Ordering::Relaxed) == mark
+        }) {
+            if bytes.len() > CACHE_BYTES || latest.load(Ordering::Relaxed) != mark {
                 continue;
             }
-            let mark = latest.load(Ordering::Relaxed);
-            let cancelled = latest.clone();
-            let keep = move || cancelled.load(Ordering::Relaxed) == mark;
-            if let Ok(Some((bytes, codec))) = api.audio_while(track.id, lossless, keep) {
-                cache.push_back(Cached {
-                    track: track.id,
-                    lossless,
-                    bytes,
-                    codec,
-                });
-                while cache.len() > CACHE_TRACKS
-                    || (cache.len() > 1
-                        && cache.iter().map(|cached| cached.bytes.len()).sum::<usize>()
-                            > CACHE_BYTES)
-                {
-                    cache.pop_front();
-                }
+            let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+            while cache.len() >= CACHE_TRACKS
+                || cache.iter().map(|c| c.bytes.len()).sum::<usize>() + bytes.len() > CACHE_BYTES
+            {
+                cache.pop_front();
             }
+            cache.push_back(Cached {
+                track: track.id,
+                lossless,
+                bytes,
+                codec,
+            });
         }
     }
 }
@@ -212,10 +228,21 @@ mod tests {
     #[test]
     fn prefetch_cache_matches_track_and_quality() {
         let mut cache = VecDeque::from([cached(1, false), cached(2, false)]);
-        assert!(take(&mut cache, 2, true).is_none(), "другое качество не подходит");
-        let hit = take(&mut cache, 2, false).expect("предзагруженный трек найден");
+        assert!(
+            take(&mut cache, 2, true).is_none(),
+            "РґСЂСѓРіРѕРµ РєР°С‡РµСЃС‚РІРѕ РЅРµ РїРѕРґС…РѕРґРёС‚"
+        );
+        let hit = take(&mut cache, 2, false)
+            .expect("РїСЂРµРґР·Р°РіСЂСѓР¶РµРЅРЅС‹Р№ С‚СЂРµРє РЅР°Р№РґРµРЅ");
         assert_eq!(hit.track, 2);
-        assert_eq!(cache.len(), 1, "использованная запись удаляется из кэша");
-        assert!(take(&mut cache, 2, false).is_none(), "повторно запись не выдаётся");
+        assert_eq!(
+            cache.len(),
+            1,
+            "РёСЃРїРѕР»СЊР·РѕРІР°РЅРЅР°СЏ Р·Р°РїРёСЃСЊ СѓРґР°Р»СЏРµС‚СЃСЏ РёР· РєСЌС€Р°"
+        );
+        assert!(
+            take(&mut cache, 2, false).is_none(),
+            "РїРѕРІС‚РѕСЂРЅРѕ Р·Р°РїРёСЃСЊ РЅРµ РІС‹РґР°С‘С‚СЃСЏ"
+        );
     }
 }

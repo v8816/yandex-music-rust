@@ -55,7 +55,7 @@ pub struct Snapshot {
     pub wave: bool,
     pub equalizer: equalizer::Settings,
     pub logged_in: bool,
-    #[serde(skip_serializing)]
+    #[serde(skip_serializing, default)]
     pub account_name: String,
     pub rpc: bool,
     pub lossless: bool,
@@ -120,6 +120,8 @@ struct Player {
     discord: Option<DiscordIpcClient>,
     last_rpc_attempt: Option<Instant>,
     wave: Option<Wave>,
+    wave_pending: Option<(String, Receiver<Result<crate::api::WaveBatch>>)>,
+    wave_retry: Option<Instant>,
     feedback: SyncSender<(Api, String, Value)>,
     eq_control: equalizer::Control,
     loader: Loader,
@@ -178,6 +180,8 @@ impl Player {
             discord: None,
             last_rpc_attempt: None,
             wave: None,
+            wave_pending: None,
+            wave_retry: None,
             feedback,
             eq_control: equalizer::Control::default(),
             loader: Loader::new(),
@@ -282,7 +286,9 @@ impl Player {
     }
 
     fn prefetch_next(&mut self) {
-        let Some(index) = self.state.index else { return };
+        let Some(index) = self.state.index else {
+            return;
+        };
         if let Some(next) = self.state.queue.get(index + 1).cloned() {
             self.loader.prefetch(&self.api, &next, self.state.lossless);
         }
@@ -417,10 +423,62 @@ impl Player {
             .map(|track| (track.id, batch_id.clone()))
             .collect();
         self.replace_queue(tracks, 0)?;
+        self.wave_pending = None;
+        self.wave_retry = None;
         self.wave = Some(Wave { session, batches });
         self.state.wave = true;
         self.wave_event("radioStarted", first, None);
         Ok(())
+    }
+
+    fn request_wave(&mut self) {
+        if self.wave_pending.is_some()
+            || self
+                .wave_retry
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(15))
+        {
+            return;
+        }
+        let Some(wave) = &self.wave else {
+            return;
+        };
+        let session = wave.session.clone();
+        let queue = self
+            .state
+            .queue
+            .iter()
+            .rev()
+            .take(60)
+            .map(|t| t.id.to_string())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        let api = self.api.clone();
+        let (tx, rx) = mpsc::channel();
+        let key = session.clone();
+        thread::spawn(move || {
+            let _ = tx.send(api.wave_more(&key, queue));
+        });
+        self.wave_pending = Some((session, rx));
+        self.wave_retry = Some(Instant::now());
+    }
+
+    fn poll_wave(&mut self) {
+        let Some((session, rx)) = &self.wave_pending else {
+            return;
+        };
+        let Ok(result) = rx.try_recv() else {
+            return;
+        };
+        let valid = self.wave.as_ref().is_some_and(|w| w.session == *session);
+        self.wave_pending = None;
+        if valid {
+            match result.and_then(|batch| self.append_wave(batch)) {
+                Ok(()) => self.prefetch_next(),
+                Err(error) => self.state.error = format!("Не удалось обновить волну: {error}"),
+            }
+        }
     }
 
     fn extend_wave(&mut self) -> Result<()> {
@@ -436,6 +494,11 @@ impl Player {
         let batch = self
             .api
             .wave_more(&wave.session, queue.into_iter().rev().collect())?;
+        self.append_wave(batch)
+    }
+
+    fn append_wave(&mut self, batch: crate::api::WaveBatch) -> Result<()> {
+        let wave = self.wave.as_mut().context("Моя волна выключена")?;
         let batch_id = batch.batch_id.clone();
         let replacement_session = batch
             .radio_session_id
@@ -510,6 +573,15 @@ impl Player {
     }
 
     fn tick(&mut self) -> bool {
+        self.poll_wave();
+        if self.wave.is_some()
+            && self
+                .state
+                .index
+                .is_some_and(|i| self.state.queue.len().saturating_sub(i + 1) <= 3)
+        {
+            self.request_wave();
+        }
         let mut changed = false;
         for loaded in self.loader.poll() {
             if loaded.generation() != self.generation {
@@ -546,10 +618,10 @@ impl Player {
             return;
         }
         let Some(track) = state.track.filter(|_| state.playing) else {
-            if let Some(rpc) = &mut self.discord {
-                if rpc.clear_activity().is_err() {
-                    self.discord = None;
-                }
+            if let Some(rpc) = &mut self.discord
+                && rpc.clear_activity().is_err()
+            {
+                self.discord = None;
             }
             return;
         };
@@ -561,27 +633,45 @@ impl Player {
                 return;
             }
             self.last_rpc_attempt = Some(Instant::now());
-            if let Ok(mut rpc) = DiscordIpcClient::new("1124055337234858005") {
-                if rpc.connect().is_ok() {
-                    self.discord = Some(rpc);
-                }
+            if let Ok(mut rpc) = DiscordIpcClient::new("1124055337234858005")
+                && rpc.connect().is_ok()
+            {
+                self.discord = Some(rpc);
             }
         }
         let artist = track.artist().chars().take(100).collect::<String>();
         let title = track.title.chars().take(100).collect::<String>();
         let link = track.url();
+        let app_link = format!("yandexmusic://track/{}", track.id);
+        let cover = track.cover().map(|uri| {
+            format!(
+                "https://{}",
+                uri.trim_start_matches("https://").replace("%%", "400x400")
+            )
+        });
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
         let mut activity = activity::Activity::new()
+            .activity_type(activity::ActivityType::Listening)
             .details(&title)
             .state(if artist.is_empty() {
                 "Яндекс Музыка"
             } else {
                 &artist
             })
-            .buttons(vec![activity::Button::new("Открыть трек", &link)]);
+            .buttons(vec![
+                activity::Button::new("Открыть в приложении", &app_link),
+                activity::Button::new("Открыть на сайте", &link),
+            ]);
+        if let Some(cover) = &cover {
+            activity = activity.assets(
+                activity::Assets::new()
+                    .large_image(cover)
+                    .large_text(&title),
+            );
+        }
         if state.duration > state.position {
             activity = activity.timestamps(
                 activity::Timestamps::new()
@@ -589,10 +679,10 @@ impl Player {
                     .end(now + (state.duration - state.position) as i64),
             );
         }
-        if let Some(rpc) = &mut self.discord {
-            if rpc.set_activity(activity).is_err() {
-                self.discord = None;
-            }
+        if let Some(rpc) = &mut self.discord
+            && rpc.set_activity(activity).is_err()
+        {
+            self.discord = None;
         }
     }
 
@@ -637,7 +727,7 @@ impl Player {
                 return Ok(json!({"storage_warning":stored.err().map(|e| e.to_string())}));
             }
             "logout" => {
-                crate::auth::clear().context("Не удалось удалить сохранённую сессию Windows")?;
+                let storage_error = crate::auth::clear().err();
                 self.generation = self.loader.cancel();
                 self.autoplay = false;
                 self.sink = None;
@@ -657,6 +747,10 @@ impl Player {
                 self.state.logged_in = false;
                 self.state.account_name.clear();
                 self.update_rpc();
+                if let Some(error) = storage_error {
+                    self.state.error =
+                        format!("Вы вышли. Не удалось удалить сохранённый токен: {error}");
+                }
             }
             "play_query" => {
                 let tracks = self.api.search(query()?)?;
@@ -701,7 +795,12 @@ impl Player {
                         if self.state.queue.is_empty() {
                             bail!("Очередь пуста");
                         }
-                        self.select(self.state.index.unwrap_or(0).min(self.state.queue.len() - 1))?;
+                        self.select(
+                            self.state
+                                .index
+                                .unwrap_or(0)
+                                .min(self.state.queue.len() - 1),
+                        )?;
                     } else if self.sink.as_ref().is_some_and(Sink::empty) {
                         self.select(self.state.index.context("Очередь пуста")?)?;
                     } else {
@@ -789,5 +888,20 @@ impl Player {
             _ => bail!("Неизвестная команда"),
         }
         Ok(json!({"ok": true}))
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    #[test]
+    fn public_snapshot_round_trip_does_not_expose_account() {
+        let state = super::Snapshot {
+            account_name: "private account".into(),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&state).unwrap();
+        assert!(json.get("account_name").is_none());
+        let restored: super::Snapshot = serde_json::from_value(json).unwrap();
+        assert!(restored.account_name.is_empty());
     }
 }

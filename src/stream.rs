@@ -1,4 +1,3 @@
-
 use std::{
     io::{self, Read, Seek, SeekFrom},
     sync::{
@@ -294,6 +293,10 @@ mod tests {
         };
         let decoded = decoder.take(8000 * 2).count();
         feeder.join().unwrap();
-        assert_eq!(decoded, 8000 * 2, "второй половины хватило для декодирования");
+        assert_eq!(
+            decoded,
+            8000 * 2,
+            "второй половины хватило для декодирования"
+        );
     }
 }

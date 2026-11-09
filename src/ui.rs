@@ -72,6 +72,9 @@ struct App {
     media: Option<MediaKeys>,
     media_error: String,
     text_focus: bool,
+    #[cfg(windows)]
+    tray: Option<crate::desktop::Tray>,
+    quitting: bool,
 }
 
 pub fn run() -> eframe::Result {
@@ -79,6 +82,7 @@ pub fn run() -> eframe::Result {
         "Яндекс Музыка · Rust",
         eframe::NativeOptions {
             viewport: ViewportBuilder::default()
+                .with_icon(crate::desktop::icon())
                 .with_inner_size([1060.0, 710.0])
                 .with_min_inner_size([410.0, 155.0]),
             ..Default::default()
@@ -110,19 +114,18 @@ impl App {
             style.spacing.button_padding = egui::vec2(12.0, 6.0);
         });
         let mut fonts = FontDefinitions::default();
-        if let Some(windows) = std::env::var_os("WINDIR") {
-            if let Ok(bytes) =
+        if let Some(windows) = std::env::var_os("WINDIR")
+            && let Ok(bytes) =
                 std::fs::read(std::path::PathBuf::from(windows).join("Fonts/segoeui.ttf"))
-            {
-                fonts
-                    .font_data
-                    .insert("segoe".into(), Arc::new(FontData::from_owned(bytes)));
-                fonts
-                    .families
-                    .entry(FontFamily::Proportional)
-                    .or_default()
-                    .insert(0, "segoe".into());
-            }
+        {
+            fonts
+                .font_data
+                .insert("segoe".into(), Arc::new(FontData::from_owned(bytes)));
+            fonts
+                .families
+                .entry(FontFamily::Proportional)
+                .or_default()
+                .insert(0, "segoe".into());
         }
         ctx.set_fonts(fonts);
         let repaint = ctx.clone();
@@ -165,12 +168,14 @@ impl App {
             media: None,
             media_error: String::new(),
             text_focus: false,
+            #[cfg(windows)]
+            tray: crate::desktop::Tray::new(ctx),
+            quitting: false,
         };
         match media::start(app.tx.clone(), app.state.clone()) {
             Some(keys) => app.media = Some(keys),
             None => {
-                app.media_error =
-                    "Не удалось перехватить мультимедийные клавиши".into();
+                app.media_error = "Не удалось перехватить мультимедийные клавиши".into();
             }
         }
         if let Ok(token) = std::env::var("YANDEX_MUSIC_TOKEN") {
@@ -440,8 +445,11 @@ impl App {
                         .color(Color32::from_gray(148))
                         .strong(),
                 );
-                for (page, title) in [(Page::Library, "Любимое"), (Page::Playlists, "Плейлисты"), (Page::Queue, "Очередь")]
-                {
+                for (page, title) in [
+                    (Page::Library, "Любимое"),
+                    (Page::Playlists, "Плейлисты"),
+                    (Page::Queue, "Очередь"),
+                ] {
                     if nav_item(ui, title, Some(page), self.page == page) {
                         self.navigate(page, s.logged_in);
                     }
@@ -582,15 +590,16 @@ impl App {
                 let mut media = self.media.is_some();
                 if ui
                     .checkbox(&mut media, "Мультимедийные клавиши клавиатуры")
-                    .on_hover_text("Плей/пауза, следующий и предыдущий трек работают при свёрнутом окне")
+                    .on_hover_text(
+                        "Плей/пауза, следующий и предыдущий трек работают при свёрнутом окне",
+                    )
                     .changed()
                 {
                     if media {
                         match media::start(self.tx.clone(), self.state.clone()) {
                             Some(keys) => self.media = Some(keys),
                             None => {
-                                self.media_error =
-                                    "Не удалось перехватить клавиши".into();
+                                self.media_error = "Не удалось перехватить клавиши".into();
                             }
                         }
                     } else {
@@ -819,7 +828,7 @@ impl App {
                             |ui| {
                                 self.covers.draw(ui, track.cover(), 46.0);
                                 if ui
-                                    .add(icon_button("▶", selected))
+                                    .add(egui::Button::new("Играть").selected(selected))
                                     .on_hover_text("Воспроизвести")
                                     .clicked()
                                 {
@@ -849,7 +858,8 @@ impl App {
                                         );
                                         ui.horizontal(|ui| {
                                             ui.spacing_mut().item_spacing.x = 4.0;
-                                            for (index, artist) in track.artists.iter().enumerate() {
+                                            for (index, artist) in track.artists.iter().enumerate()
+                                            {
                                                 if index > 0 {
                                                     ui.label(
                                                         RichText::new("·")
@@ -1018,9 +1028,9 @@ impl App {
         let label = if pending {
             "Запускаем…"
         } else if s.wave && s.playing {
-            "Ⅱ   Моя волна"
+            "Пауза · Моя волна"
         } else {
-            "▶   Моя волна"
+            "Слушать Мою волну"
         };
         let button = egui::Button::new(
             RichText::new(label)
@@ -1064,6 +1074,59 @@ impl App {
             egui::FontId::proportional(14.0),
             Color32::from_rgb(222, 213, 238),
         );
+    }
+
+    fn recommendation_cards(&mut self, ui: &mut egui::Ui, s: &Snapshot) {
+        ui.add_space(16.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Хочу рекомендации").size(22.0).strong());
+            if ui.button("Обновить волну").clicked() {
+                self.send("wave_start", json!({}));
+            }
+        });
+        if s.queue.is_empty() {
+            ui.label("Запустите Мою волну — здесь появятся треки для вас.");
+            return;
+        }
+        let start = s.index.unwrap_or(0);
+        ScrollArea::horizontal()
+            .id_salt("recommendations")
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for (index, track) in s.queue.iter().enumerate().skip(start).take(8) {
+                        Frame::new()
+                            .fill(Color32::from_rgb(29, 28, 35))
+                            .corner_radius(16)
+                            .inner_margin(12)
+                            .show(ui, |ui| {
+                                ui.set_width(140.0);
+                                self.covers.draw(ui, track.cover(), 140.0);
+                                ui.add(
+                                    egui::Label::new(RichText::new(&track.title).strong())
+                                        .truncate(),
+                                );
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(track.artist())
+                                            .color(Color32::from_gray(170)),
+                                    )
+                                    .truncate(),
+                                );
+                                ui.horizontal(|ui| {
+                                    if control(ui, ControlIcon::Play, "Играть", false).clicked()
+                                    {
+                                        self.send("queue_play", json!({"index":index}));
+                                    }
+                                    ui.label(time(track.duration_ms as f64 / 1000.0));
+                                    if ui.small_button("+").on_hover_text("В любимое").clicked()
+                                    {
+                                        self.send("like", json!({"track_id":track.id}));
+                                    }
+                                });
+                            });
+                    }
+                });
+            });
     }
 
     fn transport(&mut self, ui: &mut egui::Ui, s: &Snapshot) {
@@ -1180,10 +1243,10 @@ impl App {
                     .truncate()
                     .sense(egui::Sense::click()),
                 );
-                if let Some(artist) = artist {
-                    if subtitle.on_hover_text("Об исполнителе").clicked() {
-                        self.open_artist(artist.id, &artist.name);
-                    }
+                if let Some(artist) = artist
+                    && subtitle.on_hover_text("Об исполнителе").clicked()
+                {
+                    self.open_artist(artist.id, &artist.name);
                 }
             },
         );
@@ -1402,9 +1465,52 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        #[cfg(windows)]
+        {
+            let mut actions = Vec::new();
+            if let Some(tray) = &self.tray {
+                while let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
+                    if event.id == tray.show {
+                        actions.push(0);
+                    }
+                    if event.id == tray.play {
+                        actions.push(1);
+                    }
+                    if event.id == tray.next {
+                        actions.push(2);
+                    }
+                    if event.id == tray.quit {
+                        actions.push(3);
+                    }
+                }
+                if !self.quitting && ctx.input(|i| i.viewport().close_requested()) {
+                    ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+                    ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+                }
+            }
+            for action in actions {
+                match action {
+                    0 => {
+                        ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                        ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
+                        ctx.send_viewport_cmd(ViewportCommand::Focus);
+                    }
+                    1 => {
+                        let playing = self.state.lock().unwrap_or_else(|e| e.into_inner()).playing;
+                        self.send(if playing { "pause" } else { "play" }, json!({}));
+                    }
+                    2 => self.send("next", json!({})),
+                    _ => {
+                        self.quitting = true;
+                        ctx.send_viewport_cmd(ViewportCommand::Close);
+                    }
+                }
+            }
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
         self.poll();
         self.covers.poll(ctx);
-        let snapshot = self.state.lock().unwrap().clone();
+        let snapshot = self.state.lock().unwrap_or_else(|e| e.into_inner()).clone();
         self.flush_volume(&snapshot);
         let search_shortcut = ctx.input(|input| {
             input.events.iter().any(|event| {
@@ -1472,10 +1578,16 @@ impl eframe::App for App {
                     return;
                 }
                 match self.page {
-                    Page::Home => self.home(ui, &snapshot),
+                    Page::Home => {
+                        ScrollArea::vertical().show(ui, |ui| {
+                            self.home(ui, &snapshot);
+                            self.recommendation_cards(ui, &snapshot);
+                        });
+                    }
                     Page::Search => self.search_page(ui, &snapshot),
                     Page::Library => {
                         ui.heading("Любимое");
+                        ui.small("Последние 100 любимых треков");
                         if snapshot.logged_in {
                             if ui.button("Обновить").clicked() {
                                 self.send("library", json!({}));
@@ -1496,8 +1608,7 @@ impl eframe::App for App {
                             if ui.button("Обновить").clicked() {
                                 self.send("playlists", json!({}));
                             }
-                            let loading =
-                                self.pending.iter().any(|(name, _)| name == "playlists");
+                            let loading = self.pending.iter().any(|(name, _)| name == "playlists");
                             if loading {
                                 ui.horizontal(|ui| {
                                     ui.spinner();
@@ -1512,8 +1623,7 @@ impl eframe::App for App {
                                 let playlists = self.playlists.clone();
                                 for playlist in &playlists {
                                     ui.horizontal(|ui| {
-                                        self.covers
-                                            .draw(ui, playlist.cover_uri.as_deref(), 40.0);
+                                        self.covers.draw(ui, playlist.cover_uri.as_deref(), 40.0);
                                         ui.vertical(|ui| {
                                             if ui
                                                 .add(
