@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
-    io::{BufReader, Cursor},
+    io::BufReader,
     sync::{
         Arc, Mutex,
         mpsc::{self, Receiver, SyncSender},
@@ -230,10 +230,6 @@ impl Player {
 
     fn attach(&mut self, loaded: Loaded) {
         match loaded {
-            Loaded::Audio { bytes, codec, .. } => match Decoder::try_from(Cursor::new(bytes)) {
-                Ok(audio) => self.start_source(audio, codec),
-                Err(error) => self.fail(format!("Не удалось декодировать аудио: {error}")),
-            },
             Loaded::Stream { audio, .. } => {
                 let buffer = audio.buffer.clone();
                 let codec = audio.codec;

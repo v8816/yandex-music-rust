@@ -9,15 +9,9 @@ use std::{
     thread,
 };
 
-const CACHE_TRACKS: usize = 2;
-const CACHE_BYTES: usize = 64 * 1024 * 1024;
+const CACHE_TRACKS: usize = 1;
 
 pub enum Loaded {
-    Audio {
-        generation: u64,
-        bytes: Vec<u8>,
-        codec: String,
-    },
     Stream {
         generation: u64,
         audio: crate::api::AudioStream,
@@ -31,9 +25,7 @@ pub enum Loaded {
 impl Loaded {
     pub fn generation(&self) -> u64 {
         match self {
-            Self::Audio { generation, .. }
-            | Self::Stream { generation, .. }
-            | Self::Failed { generation, .. } => *generation,
+            Self::Stream { generation, .. } | Self::Failed { generation, .. } => *generation,
         }
     }
 }
@@ -55,8 +47,7 @@ enum Request {
 struct Cached {
     track: u64,
     lossless: bool,
-    bytes: Vec<u8>,
-    codec: String,
+    audio: crate::api::AudioStream,
 }
 
 pub struct Loader {
@@ -150,10 +141,9 @@ fn run(incoming: Receiver<Request>, loaded: Sender<Loaded>, latest: Arc<AtomicU6
                 track.id,
                 lossless,
             ) {
-                let _ = loaded.send(Loaded::Audio {
+                let _ = loaded.send(Loaded::Stream {
                     generation,
-                    bytes: cached.bytes,
-                    codec: cached.codec,
+                    audio: cached.audio,
                 });
             } else {
                 let cancelled = latest.clone();
@@ -183,23 +173,21 @@ fn prefetch_worker(incoming: Receiver<Request>, latest: Arc<AtomicU64>, cache: C
     {
         let mark = latest.load(Ordering::Relaxed);
         let cancelled = latest.clone();
-        if let Ok(Some((bytes, codec))) = api.audio_while(track.id, lossless, move || {
+        if let Ok(audio) = api.stream_audio(track.id, lossless, move || {
             cancelled.load(Ordering::Relaxed) == mark
         }) {
-            if bytes.len() > CACHE_BYTES || latest.load(Ordering::Relaxed) != mark {
+            audio.buffer.wait_finished();
+            if latest.load(Ordering::Relaxed) != mark || !audio.buffer.is_complete() {
                 continue;
             }
             let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
-            while cache.len() >= CACHE_TRACKS
-                || cache.iter().map(|c| c.bytes.len()).sum::<usize>() + bytes.len() > CACHE_BYTES
-            {
+            while cache.len() >= CACHE_TRACKS {
                 cache.pop_front();
             }
             cache.push_back(Cached {
                 track: track.id,
                 lossless,
-                bytes,
-                codec,
+                audio,
             });
         }
     }
@@ -220,8 +208,15 @@ mod tests {
         Cached {
             track,
             lossless,
-            bytes: vec![0; 4],
-            codec: "mp3".into(),
+            audio: {
+                let buffer = crate::stream::SharedBuffer::new(1024, None).unwrap();
+                buffer.finish();
+                crate::api::AudioStream {
+                    reader: buffer.reader(),
+                    buffer,
+                    codec: "mp3".into(),
+                }
+            },
         }
     }
 

@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-const MAX_COVERS: usize = 160;
+const MAX_COVERS: usize = 40;
 const MAX_BYTES: u64 = 1024 * 1024;
 type LoadedCover = (String, Option<ColorImage>);
 
@@ -37,7 +37,7 @@ impl Covers {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .ok();
-        for _ in 0..3 {
+        for _ in 0..2 {
             let (incoming, loaded, ctx, client) = (
                 incoming.clone(),
                 loaded.clone(),
@@ -98,7 +98,15 @@ impl Covers {
     }
 
     pub fn draw(&mut self, ui: &mut egui::Ui, uri: Option<&str>, size: f32) -> egui::Response {
-        let texture = uri.and_then(|uri| self.texture(ui.ctx(), uri));
+        let large_uri = if size >= 200.0 {
+            uri.map(|uri| uri.replace("%%", "400x400"))
+        } else {
+            None
+        };
+        let texture = large_uri
+            .as_deref()
+            .or(uri)
+            .and_then(|uri| self.texture(ui.ctx(), uri));
         let (rect, response) =
             ui.allocate_exact_size(egui::Vec2::splat(size), egui::Sense::click());
         if let Some(id) = texture {
@@ -107,12 +115,27 @@ impl Covers {
         } else {
             ui.painter()
                 .rect_filled(rect, 8, Color32::from_rgb(43, 42, 50));
-            ui.painter().text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                "♫",
-                egui::FontId::proportional(size * 0.46),
-                Color32::from_gray(156),
+            let center = rect.center();
+            let scale = size * 0.22;
+            let color = Color32::from_gray(156);
+            ui.painter().line_segment(
+                [
+                    center + egui::vec2(-scale * 0.4, scale * 0.5),
+                    center + egui::vec2(-scale * 0.4, -scale),
+                ],
+                egui::Stroke::new((size * 0.035).max(1.5), color),
+            );
+            ui.painter().line_segment(
+                [
+                    center + egui::vec2(-scale * 0.4, -scale),
+                    center + egui::vec2(scale * 0.7, -scale * 0.65),
+                ],
+                egui::Stroke::new((size * 0.05).max(2.0), color),
+            );
+            ui.painter().circle_filled(
+                center + egui::vec2(-scale * 0.65, scale * 0.5),
+                scale * 0.45,
+                color,
             );
         }
         response
@@ -126,6 +149,10 @@ impl Covers {
                 Cover::Ready(texture, _) => Some(texture.id()),
                 _ => None,
             };
+        }
+        if uri.contains("400x400") {
+            self.entries
+                .retain(|key, _| key == uri || !key.contains("400x400"));
         }
         if self.entries.len() >= MAX_COVERS {
             let oldest = self

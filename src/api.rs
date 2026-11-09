@@ -705,31 +705,6 @@ impl Api {
         Ok(tracks)
     }
 
-    pub fn audio_while(
-        &self,
-        track: u64,
-        lossless: bool,
-        keep: impl Fn() -> bool,
-    ) -> Result<Option<(Vec<u8>, String)>> {
-        let (url, codec) = self.download_url(track, lossless)?;
-        let mut response = self.open_audio(url)?;
-        let expected = response.content_length().unwrap_or(0);
-        let mut bytes = Vec::with_capacity(expected.min(16 * 1024 * 1024) as usize);
-        let mut chunk = vec![0u8; 64 * 1024];
-        loop {
-            if !keep() {
-                return Ok(None);
-            }
-            let read = response.read(&mut chunk)?;
-            if read == 0 {
-                break;
-            }
-            bytes.extend_from_slice(&chunk[..read]);
-            ensure!(bytes.len() as u64 <= MAX_AUDIO, "Аудиофайл слишком большой");
-        }
-        Ok(Some((bytes, codec)))
-    }
-
     pub fn stream_audio(
         &self,
         track: u64,
@@ -739,7 +714,8 @@ impl Api {
         let (url, codec) = self.download_url(track, lossless)?;
         let mut response = self.open_audio(url)?;
         let total = response.content_length();
-        let buffer = SharedBuffer::new(MAX_AUDIO as usize, total);
+        let buffer = SharedBuffer::new(MAX_AUDIO as usize, total)
+            .context("Не удалось создать временный аудиокэш")?;
         buffer.set_patience(stream::PROBE_PATIENCE);
         let prefix = PREFIX.min(total.unwrap_or(u64::MAX)) as usize;
         let mut chunk = vec![0u8; 64 * 1024];

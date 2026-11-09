@@ -1,5 +1,5 @@
 use std::{
-    io::{self, Read, Seek, SeekFrom},
+    io::{self, Read, Seek, SeekFrom, Write},
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -11,7 +11,8 @@ const PATIENCE: Duration = Duration::from_secs(20);
 pub const PROBE_PATIENCE: Duration = Duration::from_millis(150);
 
 struct State {
-    bytes: Vec<u8>,
+    file: std::fs::File,
+    len: usize,
     finished: bool,
     error: Option<String>,
 }
@@ -25,10 +26,12 @@ pub struct SharedBuffer {
 }
 
 impl SharedBuffer {
-    pub fn new(limit: usize, total: Option<u64>) -> Arc<Self> {
-        Arc::new(Self {
+    pub fn new(limit: usize, total: Option<u64>) -> io::Result<Arc<Self>> {
+        let file = tempfile::tempfile()?;
+        Ok(Arc::new(Self {
             state: Mutex::new(State {
-                bytes: Vec::new(),
+                file,
+                len: 0,
                 finished: false,
                 error: None,
             }),
@@ -36,20 +39,31 @@ impl SharedBuffer {
             limit,
             total,
             patience: AtomicU64::new(PATIENCE.as_millis() as u64),
-        })
+        }))
     }
 
     pub fn push(&self, chunk: &[u8]) -> bool {
         let Ok(mut state) = self.state.lock() else {
             return false;
         };
-        if state.bytes.len() + chunk.len() > self.limit {
+        if state.len + chunk.len() > self.limit {
             state.error = Some("Аудиофайл слишком большой".into());
             state.finished = true;
             self.signal.notify_all();
             return false;
         }
-        state.bytes.extend_from_slice(chunk);
+        let offset = state.len as u64;
+        if let Err(error) = state
+            .file
+            .seek(SeekFrom::Start(offset))
+            .and_then(|_| state.file.write_all(chunk))
+        {
+            state.error = Some(format!("Не удалось записать аудиокэш: {error}"));
+            state.finished = true;
+            self.signal.notify_all();
+            return false;
+        }
+        state.len += chunk.len();
         self.signal.notify_all();
         true
     }
@@ -85,6 +99,15 @@ impl SharedBuffer {
         }
     }
 
+    pub fn is_complete(&self) -> bool {
+        self.state
+            .lock()
+            .map(|s| {
+                s.finished && s.error.is_none() && self.total.is_none_or(|n| s.len as u64 >= n)
+            })
+            .unwrap_or(false)
+    }
+
     pub fn wait_finished(&self) {
         let Ok(mut state) = self.state.lock() else {
             return;
@@ -116,9 +139,9 @@ impl Reader {
     fn wait_for(&mut self, needed: usize) -> io::Result<bool> {
         let mut state = self.buffer.state.lock().map_err(lock_error)?;
         let patience = self.buffer.patience();
-        let mut last = state.bytes.len();
+        let mut last = state.len;
         loop {
-            if state.bytes.len() >= needed {
+            if state.len >= needed {
                 return Ok(true);
             }
             if let Some(error) = &state.error {
@@ -133,13 +156,13 @@ impl Reader {
                 .wait_timeout(state, patience)
                 .map_err(lock_error)?;
             state = next;
-            if timeout.timed_out() && state.bytes.len() == last {
+            if timeout.timed_out() && state.len == last {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "Загрузка аудио остановилась",
                 ));
             }
-            last = state.bytes.len();
+            last = state.len;
         }
     }
 }
@@ -156,10 +179,11 @@ impl Read for Reader {
         if !self.wait_for(self.position + 1)? {
             return Ok(0);
         }
-        let state = self.buffer.state.lock().map_err(lock_error)?;
-        let available = state.bytes.len() - self.position;
+        let mut state = self.buffer.state.lock().map_err(lock_error)?;
+        let available = state.len - self.position;
         let len = buf.len().min(available);
-        buf[..len].copy_from_slice(&state.bytes[self.position..self.position + len]);
+        state.file.seek(SeekFrom::Start(self.position as u64))?;
+        state.file.read_exact(&mut buf[..len])?;
         self.position += len;
         Ok(len)
     }
@@ -217,7 +241,7 @@ mod tests {
 
     #[test]
     fn reading_waits_for_the_loader() {
-        let buffer = SharedBuffer::new(1024, Some(8));
+        let buffer = SharedBuffer::new(1024, Some(8)).unwrap();
         let mut reader = buffer.reader();
         buffer.push(b"abcd");
         let mut out = [0u8; 8];
@@ -239,14 +263,14 @@ mod tests {
 
     #[test]
     fn seek_uses_the_known_length() {
-        let buffer = SharedBuffer::new(1024, Some(1000));
+        let buffer = SharedBuffer::new(1024, Some(1000)).unwrap();
         let mut reader = buffer.reader();
         buffer.push(&[7u8; 100]);
         assert_eq!(reader.seek(SeekFrom::Start(10)).unwrap(), 10);
         assert_eq!(reader.seek(SeekFrom::End(0)).unwrap(), 1000);
         assert_eq!(reader.seek(SeekFrom::Current(-30)).unwrap(), 970);
 
-        let unknown = SharedBuffer::new(1024, None);
+        let unknown = SharedBuffer::new(1024, None).unwrap();
         let mut reader = unknown.reader();
         assert!(
             reader.seek(SeekFrom::End(0)).is_err(),
@@ -256,12 +280,12 @@ mod tests {
 
     #[test]
     fn stalled_loading_reports_an_error() {
-        let buffer = SharedBuffer::new(1024, Some(10));
+        let buffer = SharedBuffer::new(1024, Some(10)).unwrap();
         buffer.set_patience(Duration::from_millis(20));
         let mut reader = buffer.reader();
         assert!(reader.read(&mut [0u8; 1]).is_err(), "данных нет — ошибка");
 
-        let failed = SharedBuffer::new(1024, Some(10));
+        let failed = SharedBuffer::new(1024, Some(10)).unwrap();
         failed.push(b"x");
         failed.fail("сеть отвалилась".into());
         let mut reader = failed.reader();
@@ -274,7 +298,7 @@ mod tests {
     fn decoder_starts_before_the_file_is_complete() {
         let data = wav(2);
         let total = data.len() as u64;
-        let buffer = SharedBuffer::new(1024 * 1024, Some(total));
+        let buffer = SharedBuffer::new(1024 * 1024, Some(total)).unwrap();
         let reader = buffer.reader();
         let split = data.len() / 2;
         buffer.push(&data[..split]);
@@ -298,5 +322,43 @@ mod tests {
             8000 * 2,
             "второй половины хватило для декодирования"
         );
+    }
+}
+
+#[cfg(test)]
+mod disk_cache_tests {
+    use super::*;
+    #[test]
+    fn large_download_stays_on_disk_and_supports_rewind() {
+        let size = 100 * 1024 * 1024;
+        let buffer = SharedBuffer::new(size, Some(size as u64)).unwrap();
+        let chunk = [37u8; 64 * 1024];
+        for _ in 0..size / chunk.len() {
+            assert!(buffer.push(&chunk));
+        }
+        buffer.finish();
+        assert!(buffer.is_complete());
+        {
+            let state = buffer.state.lock().unwrap();
+            assert_eq!(state.file.metadata().unwrap().len(), size as u64);
+        }
+        let mut reader = buffer.reader();
+        reader.seek(SeekFrom::End(-4)).unwrap();
+        let mut bytes = [0; 4];
+        reader.read_exact(&mut bytes).unwrap();
+        assert_eq!(bytes, [37; 4]);
+        reader.rewind();
+        reader.read_exact(&mut bytes).unwrap();
+        assert_eq!(bytes, [37; 4]);
+    }
+    #[test]
+    fn incomplete_or_failed_prefetch_is_not_a_cache_hit() {
+        let buffer = SharedBuffer::new(1024, Some(10)).unwrap();
+        buffer.push(b"short");
+        buffer.finish();
+        assert!(!buffer.is_complete());
+        let failed = SharedBuffer::new(1024, None).unwrap();
+        failed.fail("network".into());
+        assert!(!failed.is_complete());
     }
 }
