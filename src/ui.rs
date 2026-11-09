@@ -1030,7 +1030,7 @@ impl App {
         } else if s.wave && s.playing {
             "Пауза · Моя волна"
         } else {
-            "Слушать Мою волну"
+            "Моя волна"
         };
         let button = egui::Button::new(
             RichText::new(label)
@@ -1074,6 +1074,7 @@ impl App {
             egui::FontId::proportional(14.0),
             Color32::from_rgb(222, 213, 238),
         );
+        ui.advance_cursor_after_rect(area);
     }
 
     fn recommendation_cards(&mut self, ui: &mut egui::Ui, s: &Snapshot) {
