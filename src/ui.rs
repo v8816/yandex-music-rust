@@ -264,6 +264,8 @@ impl App {
                     | "wave_start"
                     | "wave_track"
                     | "wave_shake"
+                    | "wave_undo"
+                    | "wave_pinned"
                     | "queue_add"
                     | "login"
                     | "logout"
@@ -1154,7 +1156,28 @@ impl App {
     }
 
     fn home(&mut self, ui: &mut egui::Ui, s: &Snapshot) {
-        let height = (ui.available_height() * 0.80).clamp(310.0, 600.0);
+        let wave_busy = self.pending.iter().any(|(name, _)| {
+            matches!(
+                name.as_str(),
+                "wave_start" | "wave_track" | "wave_shake" | "wave_undo" | "wave_pinned"
+            )
+        });
+        if let Some(pin) = &s.pinned_wave {
+            ui.horizontal_wrapped(|ui| {
+                ui.small("Закреплено");
+                ui.label(RichText::new(&pin.title).strong());
+                if ui
+                    .add_enabled(s.logged_in && !wave_busy, egui::Button::new("Слушать"))
+                    .clicked()
+                {
+                    self.send("wave_pinned", json!({}));
+                }
+                if ui.button("Открепить").clicked() {
+                    self.send("wave_unpin", json!({}));
+                }
+            });
+        }
+        let height = (ui.available_height() * 0.80).clamp(360.0, 600.0);
         let (area, _) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), height),
             egui::Sense::hover(),
@@ -1167,7 +1190,7 @@ impl App {
             "Моя волна".into()
         };
         let heading_rect = egui::Rect::from_min_max(
-            area.min + egui::vec2(24.0, height * 0.25),
+            area.min + egui::vec2(24.0, height * if active { 0.16 } else { 0.25 }),
             egui::pos2(area.right() - 24.0, area.top() + height * 0.57),
         );
         ui.scope_builder(
@@ -1178,11 +1201,14 @@ impl App {
                 ui.add(
                     egui::Label::new(
                         RichText::new(heading)
-                            .size((area.width() * 0.075).clamp(30.0, 64.0))
+                            .size(
+                                (area.width() * 0.075)
+                                    .clamp(28.0, if active { 56.0 } else { 64.0 }),
+                            )
                             .strong()
                             .color(Color32::WHITE),
                     )
-                    .wrap(),
+                    .truncate(),
                 );
             },
         );
@@ -1190,7 +1216,14 @@ impl App {
             ui.painter().text(
                 egui::pos2(area.center().x, area.top() + 24.0),
                 egui::Align2::CENTER_CENTER,
-                "МОЯ ВОЛНА",
+                if s.wave_station
+                    .as_ref()
+                    .is_some_and(|station| station.seed_track.is_some())
+                {
+                    "ВОЛНА ПО ТРЕКУ"
+                } else {
+                    "МОЯ ВОЛНА"
+                },
                 egui::FontId::proportional(13.0),
                 YELLOW,
             );
@@ -1211,10 +1244,7 @@ impl App {
                         self.send("previous", json!({}));
                     }
                 });
-                let pending = self.pending.iter().any(|(name, _)| {
-                    matches!(name.as_str(), "wave_start" | "wave_track" | "wave_shake")
-                });
-                ui.add_enabled_ui(!pending, |ui| {
+                ui.add_enabled_ui(!wave_busy, |ui| {
                     if control(
                         ui,
                         if s.wave && s.playing {
@@ -1256,6 +1286,23 @@ impl App {
             },
         );
         if let Some(track) = s.track.as_ref().filter(|_| active) {
+            let size = (height * 0.22).clamp(80.0, 108.0);
+            let cover_rect = egui::Rect::from_center_size(
+                egui::pos2(area.center().x, area.bottom() - 136.0 - size * 0.5),
+                egui::vec2(size, size),
+            );
+            ui.scope_builder(
+                egui::UiBuilder::new()
+                    .max_rect(cover_rect)
+                    .layout(Layout::top_down(Align::Center)),
+                |ui| {
+                    let cover = self.covers.draw(ui, track.cover(), size);
+                    if cover.clicked() {
+                        self.open_track_view(ui.ctx(), track);
+                    }
+                    self.track_menu(&cover, track);
+                },
+            );
             let rect = egui::Rect::from_center_size(
                 egui::pos2(area.center().x, area.bottom() - 115.0),
                 egui::vec2((area.width() - 40.0).min(480.0), 24.0),
@@ -1272,29 +1319,43 @@ impl App {
                 self.open_track_view(ui.ctx(), track);
             }
         }
+        ui.advance_cursor_after_rect(area);
         if active {
-            let rect = egui::Rect::from_center_size(
-                egui::pos2(area.center().x, area.bottom() - 22.0),
-                egui::vec2(164.0, 30.0),
-            );
-            let busy = self.pending.iter().any(|(name, _)| {
-                matches!(name.as_str(), "wave_start" | "wave_track" | "wave_shake")
-            });
-            ui.scope_builder(
-                egui::UiBuilder::new()
-                    .max_rect(rect)
-                    .layout(Layout::top_down(Align::Center)),
+            let pinned = s.wave_station.is_some() && s.wave_station == s.pinned_wave;
+            ui.with_layout(
+                Layout::left_to_right(Align::Center)
+                    .with_main_align(Align::Center)
+                    .with_main_wrap(true),
                 |ui| {
                     if ui
-                        .add_enabled(!busy, egui::Button::new("Встряхнуть волну"))
+                        .add_enabled(!wave_busy, egui::Button::new("Встряхнуть волну"))
                         .clicked()
                     {
                         self.send("wave_shake", json!({}));
                     }
+                    if s.wave_undo
+                        && ui
+                            .add_enabled(!wave_busy, egui::Button::new("Вернуть прежнюю"))
+                            .clicked()
+                    {
+                        self.send("wave_undo", json!({}));
+                    }
+                    if ui
+                        .add_enabled(
+                            !wave_busy && !pinned,
+                            egui::Button::new(if pinned {
+                                "Закреплена"
+                            } else {
+                                "Закрепить"
+                            }),
+                        )
+                        .clicked()
+                    {
+                        self.send("wave_pin", json!({}));
+                    }
                 },
             );
         }
-        ui.advance_cursor_after_rect(area);
     }
 
     fn track_menu(&mut self, response: &egui::Response, track: &Track) {
@@ -1319,7 +1380,10 @@ impl App {
             ui.close();
         }
         if ui.button("Моя волна по треку").clicked() {
-            self.send("wave_track", json!({"track_id": track.id}));
+            self.send(
+                "wave_track",
+                json!({"track_id": track.id, "title": track.title}),
+            );
             ui.close();
         }
         ui.menu_button("Добавить в плейлист", |ui| {
@@ -1376,13 +1440,13 @@ impl App {
             .as_ref()
             .map(|t| t.id);
         self.detail_track = Some(track.clone());
-        ctx.send_viewport_cmd(ViewportCommand::Fullscreen(true));
+        ctx.request_repaint();
     }
 
     fn close_track_view(&mut self, ctx: &Context) {
         self.detail_track = None;
         self.detail_playback_id = None;
-        ctx.send_viewport_cmd(ViewportCommand::Fullscreen(false));
+        ctx.request_repaint();
     }
 
     fn recommendation_cards(&mut self, ui: &mut egui::Ui, s: &Snapshot) {
@@ -1542,7 +1606,13 @@ impl App {
             ui.add_space(12.0);
             ui.horizontal(|ui| {
                 ui.add_space(12.0);
-                if control(ui, ControlIcon::Collapse, "Свернуть плеер (Esc)", false).clicked()
+                if control(
+                    ui,
+                    ControlIcon::Collapse,
+                    "Свернуть плеер (Esc) · На весь экран (F11)",
+                    false,
+                )
+                .clicked()
                 {
                     self.close_track_view(ui.ctx());
                 }
@@ -2046,6 +2116,10 @@ impl eframe::App for App {
         self.covers.poll(ctx);
         let snapshot = self.state.lock().unwrap_or_else(|e| e.into_inner()).clone();
         self.flush_volume(&snapshot);
+        if ctx.input(|input| input.key_pressed(Key::F11)) {
+            let fullscreen = ctx.input(|input| input.viewport().fullscreen.unwrap_or(false));
+            ctx.send_viewport_cmd(ViewportCommand::Fullscreen(!fullscreen));
+        }
         let search_shortcut = ctx.input(|input| {
             input.events.iter().any(|event| {
                 matches!(event, egui::Event::Key { key: Key::K, pressed: true, modifiers, .. }
