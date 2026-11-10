@@ -66,7 +66,10 @@ pub struct Snapshot {
     pub error: String,
 }
 
-pub fn start(wake_ui: impl Fn() + Send + 'static) -> (SyncSender<Job>, Arc<Mutex<Snapshot>>) {
+pub fn start(
+    wake_ui: impl Fn() + Send + 'static,
+    window: Option<isize>,
+) -> (SyncSender<Job>, Arc<Mutex<Snapshot>>) {
     let (tx, rx) = mpsc::sync_channel::<Job>(12);
     let state = Arc::new(Mutex::new(Snapshot::default()));
     let published = state.clone();
@@ -79,7 +82,21 @@ pub fn start(wake_ui: impl Fn() + Send + 'static) -> (SyncSender<Job>, Arc<Mutex
                 return;
             }
         };
-        *published.lock().unwrap() = player.snapshot();
+        let (media_tx, media_rx) = mpsc::sync_channel::<Job>(8);
+        #[cfg(windows)]
+        let mut media =
+            window.and_then(|hwnd| crate::media_session::Session::new(hwnd, media_tx).ok());
+        #[cfg(not(windows))]
+        let _ = (window, media_tx);
+        let mut publish = |player: &Player| {
+            let snapshot = player.snapshot();
+            #[cfg(windows)]
+            if let Some(media) = &mut media {
+                media.update(&snapshot);
+            }
+            *published.lock().unwrap() = snapshot;
+        };
+        publish(&player);
         wake_ui();
         loop {
             let wait = if player.state.loading {
@@ -89,7 +106,10 @@ pub fn start(wake_ui: impl Fn() + Send + 'static) -> (SyncSender<Job>, Arc<Mutex
             } else {
                 750
             };
-            match rx.recv_timeout(Duration::from_millis(wait)) {
+            match media_rx
+                .try_recv()
+                .map_or_else(|_| rx.recv_timeout(Duration::from_millis(wait)), Ok)
+            {
                 Ok(job) => {
                     if player.forward(&job) {
                         continue;
@@ -97,14 +117,14 @@ pub fn start(wake_ui: impl Fn() + Send + 'static) -> (SyncSender<Job>, Arc<Mutex
                     let result = player
                         .command(&job.name, &job.args)
                         .map_err(|e| e.to_string());
-                    *published.lock().unwrap() = player.snapshot();
+                    publish(&player);
                     let _ = job.reply.send(result);
                     wake_ui();
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     let changed = player.tick();
                     if changed || player.state.playing || player.state.loading {
-                        *published.lock().unwrap() = player.snapshot();
+                        publish(&player);
                         wake_ui();
                     }
                 }
@@ -892,7 +912,10 @@ impl Player {
                 );
                 self.state.repeat = mode.to_owned();
             }
-            "shuffle" => self.state.shuffle = boolean()?,
+            "shuffle" => {
+                ensure!(!self.state.wave, "Порядок треков задаёт Моя волна");
+                self.state.shuffle = boolean()?;
+            }
             "equalizer" => {
                 ensure!(
                     a.get("enabled").is_some() || a.get("gains").is_some(),

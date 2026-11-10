@@ -442,11 +442,7 @@ impl Api {
             .pointer("/library/tracks")
             .and_then(Value::as_array)
             .context("Не удалось получить список любимых треков")?;
-        let ids = entries
-            .iter()
-            .take(100)
-            .filter_map(item_id)
-            .collect::<Vec<_>>();
+        let ids = entries.iter().filter_map(item_id).collect::<Vec<_>>();
         if ids.is_empty() {
             return Ok(vec![]);
         }

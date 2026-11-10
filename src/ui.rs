@@ -91,16 +91,24 @@ pub fn run() -> eframe::Result {
                 .with_min_inner_size([560.0, 480.0]),
             ..Default::default()
         },
-        Box::new(|cc| Ok(Box::new(App::new(&cc.egui_ctx)))),
+        Box::new(|cc| {
+            let mut window = None;
+            #[cfg(windows)]
+            {
+                use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                if let Ok(handle) = cc.window_handle()
+                    && let RawWindowHandle::Win32(handle) = handle.as_raw()
+                {
+                    window = Some(handle.hwnd.get());
+                }
+            }
+            Ok(Box::new(App::new_internal(&cc.egui_ctx, true, window)))
+        }),
     )
 }
 
 impl App {
-    fn new(ctx: &Context) -> Self {
-        Self::new_internal(ctx, true)
-    }
-
-    fn new_internal(ctx: &Context, connect: bool) -> Self {
+    fn new_internal(ctx: &Context, connect: bool, window: Option<isize>) -> Self {
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = Color32::from_rgb(17, 17, 20);
         visuals.extreme_bg_color = Color32::from_gray(13);
@@ -147,7 +155,7 @@ impl App {
         ctx.set_fonts(fonts);
         let repaint = ctx.clone();
         let (tx, state) = if connect {
-            player::start(move || repaint.request_repaint())
+            player::start(move || repaint.request_repaint(), window)
         } else {
             let (tx, _) = std::sync::mpsc::sync_channel(1);
             (tx, Arc::new(Mutex::new(Snapshot::default())))
@@ -1702,7 +1710,17 @@ impl App {
     }
 
     fn mode_buttons(&mut self, ui: &mut egui::Ui, s: &Snapshot) {
-        if control(
+        if s.wave {
+            ui.add_enabled_ui(false, |ui| {
+                control(
+                    ui,
+                    ControlIcon::Shuffle,
+                    "Порядок треков задаёт Моя волна",
+                    false,
+                )
+                .on_disabled_hover_text("Порядок треков задаёт Моя волна");
+            });
+        } else if control(
             ui,
             ControlIcon::Shuffle,
             if s.shuffle {
@@ -1976,12 +1994,15 @@ impl eframe::App for App {
                     Page::Search => self.search_page(ui, &snapshot),
                     Page::Library => {
                         ui.heading("Любимое");
-                        ui.small("Последние 100 любимых треков");
+
                         if snapshot.logged_in {
                             if ui.button("Обновить").clicked() {
                                 self.send("library", json!({}));
                             }
-                            self.rows(ui, &self.library.clone(), None, false);
+                            ui.small(format!("Треков: {}", self.library.len()));
+                            let library = std::mem::take(&mut self.library);
+                            self.rows(ui, &library, None, false);
+                            self.library = library;
                         } else {
                             ui.label("Войдите, чтобы увидеть любимые треки.");
                             if ui.add(primary("Войти в аккаунт")).clicked() {
@@ -2078,6 +2099,9 @@ impl eframe::App for App {
                 }
             });
         self.equalizer_window(ctx, snapshot.equalizer);
+        if !self.pending.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
     }
 }
 
@@ -2406,12 +2430,12 @@ fn paint_control(painter: &egui::Painter, center: egui::Pos2, color: Color32, ic
 
 fn draw_wave(ui: &egui::Ui, rect: egui::Rect, playing: bool) {
     let painter = ui.painter().with_clip_rect(rect);
-    painter.rect_filled(rect, 20, Color32::from_rgb(8, 8, 10));
     let t = if playing {
         ui.input(|i| i.time) as f32 * 0.22
     } else {
         0.0
     };
+    let fade = (rect.width().min(rect.height()) * 0.20).max(1.0);
     for (offset, color, scale) in [
         (
             egui::vec2(-0.12, 0.02),
@@ -2434,17 +2458,26 @@ fn draw_wave(ui: &egui::Ui, rect: egui::Rect, playing: bool) {
         let mut mesh = egui::Mesh::default();
         for ring in 0..=12 {
             let r = ring as f32 / 12.0;
-            let alpha = ((1.0 - r * r).max(0.0).powi(2) * 145.0) as u8;
+            let strength = (1.0 - r * r).max(0.0).powi(2) * 145.0;
             for step in 0..48 {
                 let angle = step as f32 * std::f32::consts::TAU / 48.0;
                 let wobble = 1.0 + 0.1 * (angle * 3.0 + t).sin();
+                let pos = center
+                    + egui::vec2(
+                        angle.cos() * radius.x * r * wobble,
+                        angle.sin() * radius.y * r * wobble,
+                    );
+                let x = ((pos.x - rect.left()).min(rect.right() - pos.x) / fade).clamp(0.0, 1.0);
+                let y = ((pos.y - rect.top()).min(rect.bottom() - pos.y) / fade).clamp(0.0, 1.0);
+                let edge = x * x * (3.0 - 2.0 * x) * y * y * (3.0 - 2.0 * y);
                 mesh.colored_vertex(
-                    center
-                        + egui::vec2(
-                            angle.cos() * radius.x * r * wobble,
-                            angle.sin() * radius.y * r * wobble,
-                        ),
-                    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha),
+                    pos,
+                    Color32::from_rgba_unmultiplied(
+                        color.r(),
+                        color.g(),
+                        color.b(),
+                        (strength * edge) as u8,
+                    ),
                 );
             }
         }
@@ -2587,7 +2620,7 @@ mod card_layout_tests {
     #[test]
     fn short_navigation_scrolls_without_overlapping_settings_and_queue() {
         let ctx = Context::default();
-        let mut app = App::new_internal(&ctx, false);
+        let mut app = App::new_internal(&ctx, false, None);
         let output = ctx.run(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -2624,7 +2657,7 @@ mod card_layout_tests {
     #[test]
     fn detail_play_button_stays_in_the_center_of_the_page() {
         let ctx = Context::default();
-        let mut app = App::new_internal(&ctx, false);
+        let mut app = App::new_internal(&ctx, false, None);
         let track: Track = serde_json::from_value(
             json!({"id":42,"title":"Test song","artists":[{"id":1,"name":"Test artist"}]}),
         )
@@ -2676,7 +2709,7 @@ mod card_layout_tests {
     #[test]
     fn recommendation_keeps_title_and_artist_below_cover_at_minimum_width() {
         let ctx = Context::default();
-        let mut app = App::new_internal(&ctx, false);
+        let mut app = App::new_internal(&ctx, false, None);
         let track: Track = serde_json::from_value(json!({"id":42,"title":"Test song","artists":[{"id":1,"name":"Test artist"}],"durationMs":120000})).unwrap();
         let snapshot = Snapshot {
             queue: vec![track],
