@@ -57,7 +57,7 @@ fn tools() -> Value {
             &json!({"artist_id":{"type":"integer","minimum":1}}),
             &["artist_id"][..],
         ),
-        ("library", "Read up to 100 liked tracks.", &no_args, &[][..]),
+        ("library", "Read all liked tracks.", &no_args, &[][..]),
         (
             "playlists",
             "Read the signed-in listener's playlists from their profile.",
@@ -349,7 +349,7 @@ mod tests {
 
     #[test]
     fn bridge_changes_the_shared_player_and_checks_access() {
-        let (tx, snapshot) = crate::player::start(|| {});
+        let (tx, snapshot) = crate::player::start(|| {}, None);
         let bridge = Bridge::start(tx).unwrap();
         let result = invoke(
             bridge.port,
@@ -377,7 +377,7 @@ mod tests {
     #[test]
     #[ignore = "calls the live Yandex Music API"]
     fn public_search_through_bridge() {
-        let (tx, _) = crate::player::start(|| {});
+        let (tx, _) = crate::player::start(|| {}, None);
         let bridge = Bridge::start(tx).unwrap();
         let tracks = invoke(
             bridge.port,

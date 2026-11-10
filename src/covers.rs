@@ -171,7 +171,7 @@ impl Covers {
     }
 }
 
-fn cover_url(uri: &str) -> Option<Url> {
+pub(crate) fn cover_url(uri: &str) -> Option<Url> {
     let uri = uri.replace("%%", "100x100");
     let mut url = Url::parse(&uri)
         .ok()

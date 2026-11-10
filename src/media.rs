@@ -239,7 +239,7 @@ mod tests {
     #[test]
     #[ignore = "registers real system-wide media hotkeys while running"]
     fn hotkeys_fall_back_to_a_hook_and_are_released_on_drop() {
-        let (tx, state) = crate::player::start(|| {});
+        let (tx, state) = crate::player::start(|| {}, None);
         let first = start(tx.clone(), state.clone()).expect("клавиши должны захватываться");
         assert!(
             !first.uses_hook(),
@@ -267,7 +267,7 @@ mod tests {
     #[test]
     #[ignore = "presses synthetic media keys and drives the real player thread"]
     fn next_media_key_switches_the_track() {
-        let (tx, state) = crate::player::start(|| {});
+        let (tx, state) = crate::player::start(|| {}, None);
         let _keys = start(tx.clone(), state.clone()).expect("клавиши должны захватываться");
         play_first_track(&tx, &state);
         press_next_media_key();
@@ -280,7 +280,7 @@ mod tests {
     #[test]
     #[ignore = "registers real hotkeys and a keyboard hook while running"]
     fn hook_mode_handles_media_keys_when_hotkeys_are_busy() {
-        let (tx, state) = crate::player::start(|| {});
+        let (tx, state) = crate::player::start(|| {}, None);
         let _hotkeys = start(tx.clone(), state.clone()).expect("первый экземпляр");
         let hook = start(tx.clone(), state.clone()).expect("второй экземпляр на хуке");
         assert!(hook.uses_hook(), "второй экземпляр переходит на хук");

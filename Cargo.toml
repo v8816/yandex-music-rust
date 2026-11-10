@@ -1,6 +1,6 @@
 [package]
 name = "yandex-music-rust"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 autobins = false
 
@@ -28,7 +28,12 @@ rodio = { version = "0.21.1", default-features = false, features = ["wav"] }
 
 [target.'cfg(windows)'.dependencies]
 tray-icon = "0.21"
+raw-window-handle = "0.6"
 windows = { version = "0.54", features = [
+    "Foundation",
+    "Media",
+    "Storage_Streams",
+    "Win32_System_WinRT",
     "Win32_Foundation",
     "Win32_Security_Credentials",
     "Win32_System_Threading",
