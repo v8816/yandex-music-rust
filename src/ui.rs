@@ -1322,39 +1322,32 @@ impl App {
         ui.advance_cursor_after_rect(area);
         if active {
             let pinned = s.wave_station.is_some() && s.wave_station == s.pinned_wave;
-            ui.with_layout(
-                Layout::left_to_right(Align::Center)
-                    .with_main_align(Align::Center)
-                    .with_main_wrap(true),
-                |ui| {
-                    if ui
-                        .add_enabled(!wave_busy, egui::Button::new("Встряхнуть волну"))
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add_enabled(!wave_busy, egui::Button::new("Встряхнуть волну"))
+                    .clicked()
+                {
+                    self.send("wave_shake", json!({}));
+                }
+                if s.wave_undo
+                    && ui
+                        .add_enabled(!wave_busy, egui::Button::new("Вернуть прежнюю"))
                         .clicked()
-                    {
-                        self.send("wave_shake", json!({}));
-                    }
-                    if s.wave_undo
-                        && ui
-                            .add_enabled(!wave_busy, egui::Button::new("Вернуть прежнюю"))
-                            .clicked()
-                    {
-                        self.send("wave_undo", json!({}));
-                    }
-                    if ui
-                        .add_enabled(
-                            !wave_busy && !pinned,
-                            egui::Button::new(if pinned {
-                                "Закреплена"
-                            } else {
-                                "Закрепить"
-                            }),
-                        )
-                        .clicked()
-                    {
-                        self.send("wave_pin", json!({}));
-                    }
-                },
-            );
+                {
+                    self.send("wave_undo", json!({}));
+                }
+                let label = if pinned {
+                    "Закреплена"
+                } else {
+                    "Закрепить"
+                };
+                if ui
+                    .add_enabled(!wave_busy && !pinned, egui::Button::new(label))
+                    .clicked()
+                {
+                    self.send("wave_pin", json!({}));
+                }
+            });
         }
     }
 
