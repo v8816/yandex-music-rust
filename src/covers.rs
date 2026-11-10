@@ -89,11 +89,11 @@ impl Covers {
     }
 
     pub fn palette(&self, uri: Option<&str>) -> Color32 {
-        uri.and_then(|uri| self.entries.get(uri))
-            .and_then(|(_, c)| match c {
-                Cover::Ready(_, color) => Some(*color),
-                _ => None,
-            })
+        let ready_color = |uri: &str| match self.entries.get(uri) {
+            Some((_, Cover::Ready(_, color))) => Some(*color),
+            _ => None,
+        };
+        uri.and_then(|uri| ready_color(uri).or_else(|| ready_color(&uri.replace("%%", "400x400"))))
             .unwrap_or(Color32::from_rgb(65, 45, 90))
     }
 

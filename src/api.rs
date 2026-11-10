@@ -320,28 +320,31 @@ impl Api {
         Ok(body.get("result").cloned().unwrap_or(body))
     }
 
-    pub fn wave_start(&self) -> Result<WaveBatch> {
-        self.wave_new(vec![])
-    }
-
-    fn wave_new(&self, queue: Vec<String>) -> Result<WaveBatch> {
+    pub fn wave_start(&self, seed_track: Option<u64>, queue: Vec<String>) -> Result<WaveBatch> {
+        let seed =
+            seed_track.map_or_else(|| "user:onyourwave".to_owned(), |id| format!("track:{id}"));
         self.wave_request(
             "rotor/session/new",
             json!({
-                "seeds":["user:onyourwave"], "includeTracksInResponse":true, "interactive":true,
+                "seeds":[seed], "includeTracksInResponse":true, "interactive":true,
                 "queue":queue
             }),
         )
     }
 
-    pub fn wave_more(&self, session: &str, queue: Vec<String>) -> Result<WaveBatch> {
+    pub fn wave_more(
+        &self,
+        session: &str,
+        queue: Vec<String>,
+        seed_track: Option<u64>,
+    ) -> Result<WaveBatch> {
         ensure!(valid_session(session), "Некорректный номер сессии");
         let batch = self.wave_request(
             &format!("rotor/session/{session}/tracks"),
             json!({"queue":&queue}),
         )?;
         if batch.unknown_session {
-            self.wave_new(queue)
+            self.wave_start(seed_track, queue)
         } else {
             Ok(batch)
         }
@@ -433,6 +436,46 @@ impl Api {
         Ok(serde_json::from_value(
             v.get(0).context("Трек не найден")?.clone(),
         )?)
+    }
+
+    pub fn recommendations(&self) -> Result<Vec<Track>> {
+        let uid = self.uid.context("Сначала войдите в аккаунт")?;
+        let daily = self.get("playlists/personal/daily", &[])?;
+        let playlist = daily
+            .get("data")
+            .filter(|data| data.is_object())
+            .unwrap_or(&daily);
+        let body;
+        let items = if let Some(items) = playlist["tracks"]
+            .as_array()
+            .filter(|items| !items.is_empty())
+        {
+            items
+        } else {
+            let kind = playlist["kind"]
+                .as_u64()
+                .context("Плейлист дня ещё не готов")?;
+            let owner = playlist["uid"]
+                .as_u64()
+                .or_else(|| playlist.pointer("/owner/uid").and_then(Value::as_u64))
+                .unwrap_or(uid);
+            body = self.get(&format!("users/{owner}/playlists/{kind}"), &[])?;
+            body["tracks"]
+                .as_array()
+                .context("Не удалось получить треки Плейлиста дня")?
+        };
+        let mut seen = std::collections::HashSet::new();
+        let ids = items
+            .iter()
+            .filter_map(item_id)
+            .filter(|id| seen.insert(*id))
+            .take(24)
+            .collect::<Vec<_>>();
+        Ok(self
+            .tracks_by_ids(&ids)?
+            .into_iter()
+            .filter(|track| track.available != Some(false))
+            .collect())
     }
 
     pub fn library(&self) -> Result<Vec<Track>> {
@@ -988,12 +1031,12 @@ mod tests {
     #[ignore = "calls the live public Rotor metadata API"]
     fn wave_metadata_decodes_and_continues() {
         let api = Api::new().unwrap();
-        let first = api.wave_start().unwrap();
+        let first = api.wave_start(None, vec![]).unwrap();
         let id = first.radio_session_id.clone().unwrap();
         let tracks = first.tracks();
         assert!(!tracks.is_empty());
         let queue = tracks.iter().map(|track| track.id.to_string()).collect();
-        let next = api.wave_more(&id, queue).unwrap();
+        let next = api.wave_more(&id, queue, None).unwrap();
         assert!(
             next.tracks()
                 .iter()

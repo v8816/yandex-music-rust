@@ -54,6 +54,21 @@ impl RpcSettings {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaveStation {
+    pub seed_track: Option<u64>,
+    pub title: String,
+}
+
+impl Default for WaveStation {
+    fn default() -> Self {
+        Self {
+            seed_track: None,
+            title: "Моя волна".into(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

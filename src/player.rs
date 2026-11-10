@@ -1,5 +1,6 @@
 use crate::api::{Api, Track};
 use crate::equalizer::{self, Equalized};
+use crate::preferences::WaveStation;
 use crate::worker::{Loaded, Loader};
 use anyhow::{Context, Result, bail, ensure};
 use discord_rich_presence::{DiscordIpc, DiscordIpcClient, activity};
@@ -53,6 +54,10 @@ pub struct Snapshot {
     pub repeat: String,
     pub shuffle: bool,
     pub wave: bool,
+    #[serde(default)]
+    pub wave_undo: bool,
+    #[serde(default)]
+    pub wave_station: Option<WaveStation>,
     pub equalizer: equalizer::Settings,
     pub logged_in: bool,
     #[serde(skip_serializing, default)]
@@ -144,6 +149,8 @@ struct Player {
     discord: Option<DiscordIpcClient>,
     last_rpc_attempt: Option<Instant>,
     wave: Option<Wave>,
+    wave_history: Option<WaveHistory>,
+    resume_position: Option<f64>,
     wave_pending: Option<(String, Receiver<Result<crate::api::WaveBatch>>)>,
     wave_retry: Option<Instant>,
     feedback: SyncSender<(Api, String, Value)>,
@@ -156,9 +163,19 @@ struct Player {
 
 type ReadTask = (Api, String, Value, mpsc::Sender<Reply>);
 
+#[derive(Clone)]
 struct Wave {
+    station: WaveStation,
     session: String,
     batches: HashMap<u64, String>,
+}
+
+struct WaveHistory {
+    wave: Wave,
+    tracks: Vec<Track>,
+    index: usize,
+    position: f64,
+    autoplay: bool,
 }
 
 impl Player {
@@ -178,6 +195,7 @@ impl Player {
                         .search(args["query"].as_str().unwrap_or_default())
                         .map(|tracks| json!(tracks)),
                     "library" => api.library().map(|tracks| json!(tracks)),
+                    "recommendations" => api.recommendations().map(|tracks| json!(tracks)),
                     "playlists" => api.playlists().map(|playlists| json!(playlists)),
                     "playlist_create" => {
                         api.create_playlist(args["title"].as_str().unwrap_or_default())
@@ -212,6 +230,8 @@ impl Player {
             discord: None,
             last_rpc_attempt: None,
             wave: None,
+            wave_history: None,
+            resume_position: None,
             wave_pending: None,
             wave_retry: None,
             feedback,
@@ -225,6 +245,8 @@ impl Player {
 
     fn snapshot(&self) -> Snapshot {
         let mut s = self.state.clone();
+        s.wave_undo = self.wave_history.is_some();
+        s.wave_station = self.wave.as_ref().map(|wave| wave.station.clone());
         if let Some(sink) = &self.sink {
             s.position = sink.get_pos().as_secs_f64();
             s.playing = !sink.is_paused() && !sink.empty();
@@ -234,6 +256,7 @@ impl Player {
 
     fn play_audio(&mut self, track: &Track, index: Option<usize>) -> u64 {
         self.generation = self.loader.play(&self.api, track, self.state.lossless);
+        self.resume_position = None;
         self.autoplay = true;
         self.sink = None;
         self.state.track = Some(track.clone());
@@ -292,6 +315,11 @@ impl Player {
         sink.pause();
         sink.set_volume(self.state.volume);
         sink.append(Equalized::new(audio, self.eq_control.clone()));
+        if let Some(position) = self.resume_position.take().filter(|seconds| *seconds > 0.0)
+            && let Err(error) = sink.try_seek(Duration::from_secs_f64(position))
+        {
+            self.state.error = format!("Не удалось восстановить позицию трека: {error}");
+        }
         if self.autoplay {
             sink.play();
         }
@@ -339,6 +367,7 @@ impl Player {
                 }
             },
             "library" => ("library", json!({})),
+            "recommendations" => ("recommendations", json!({})),
             "playlists" => ("playlists", json!({})),
             "playlist_add" => ("playlist_add", job.args.clone()),
             "playlist_create" => ("playlist_create", job.args.clone()),
@@ -394,6 +423,9 @@ impl Player {
             self.wave_event("skip", id, Some(seconds));
         }
         self.wave = None;
+        self.wave_history = None;
+        self.wave_pending = None;
+        self.wave_retry = None;
         self.state.wave = false;
         Ok(())
     }
@@ -430,12 +462,12 @@ impl Player {
         ));
     }
 
-    fn start_wave(&mut self) -> Result<()> {
+    fn start_wave(&mut self, station: WaveStation, exclude: Vec<String>) -> Result<()> {
         ensure!(
             self.state.logged_in,
             "Войдите в Яндекс ID, чтобы запустить Мою волну"
         );
-        let response = self.api.wave_start()?;
+        let response = self.api.wave_start(station.seed_track, exclude)?;
         let session = response
             .radio_session_id
             .clone()
@@ -455,7 +487,11 @@ impl Player {
         self.replace_queue(tracks, 0)?;
         self.wave_pending = None;
         self.wave_retry = None;
-        self.wave = Some(Wave { session, batches });
+        self.wave = Some(Wave {
+            station,
+            session,
+            batches,
+        });
         self.state.wave = true;
         self.wave_event("radioStarted", first, None);
         Ok(())
@@ -473,6 +509,7 @@ impl Player {
             return;
         };
         let session = wave.session.clone();
+        let seed_track = wave.station.seed_track;
         let queue = self
             .state
             .queue
@@ -488,7 +525,7 @@ impl Player {
         let (tx, rx) = mpsc::channel();
         let key = session.clone();
         thread::spawn(move || {
-            let _ = tx.send(api.wave_more(&key, queue));
+            let _ = tx.send(api.wave_more(&key, queue, seed_track));
         });
         self.wave_pending = Some((session, rx));
         self.wave_retry = Some(Instant::now());
@@ -521,9 +558,11 @@ impl Player {
             .take(60)
             .map(|track| track.id.to_string())
             .collect::<Vec<_>>();
-        let batch = self
-            .api
-            .wave_more(&wave.session, queue.into_iter().rev().collect())?;
+        let batch = self.api.wave_more(
+            &wave.session,
+            queue.into_iter().rev().collect(),
+            wave.station.seed_track,
+        )?;
         self.append_wave(batch)
     }
 
@@ -628,7 +667,7 @@ impl Player {
             }
             changed = true;
         }
-        if self.state.rpc && self.state.playing && self.discord.is_none() {
+        if self.state.rpc && self.sink.is_some() && self.discord.is_none() {
             self.update_rpc();
         }
         changed
@@ -647,7 +686,13 @@ impl Player {
             self.clear_rpc();
             return;
         }
-        let Some(track) = state.track.filter(|_| state.playing) else {
+        if state.loading {
+            return;
+        }
+        let Some(track) = state
+            .track
+            .filter(|_| self.sink.as_ref().is_some_and(|sink| !sink.empty()))
+        else {
             if let Some(rpc) = &mut self.discord
                 && rpc.clear_activity().is_err()
             {
@@ -695,14 +740,29 @@ impl Player {
                 activity::Button::new("Открыть в приложении", &app_link),
                 activity::Button::new("Открыть на сайте", &link),
             ]);
-        if let Some(cover) = &cover {
-            activity = activity.assets(
-                activity::Assets::new()
-                    .large_image(cover)
-                    .large_text(&title),
-            );
-        }
-        if state.duration > state.position {
+        const ASSETS: &str =
+            "https://raw.githubusercontent.com/v8816/yandex-music-rust/dev/desktop-polish/assets";
+        let icon = if state.playing {
+            "rpc-playing.png"
+        } else {
+            "rpc-paused.png"
+        };
+        let small_image = format!("{ASSETS}/{icon}");
+        let fallback_cover = format!("{ASSETS}/app.png");
+        let status = match (state.playing, state.rpc_settings.language == "en") {
+            (true, true) => "Playing",
+            (false, true) => "Paused",
+            (true, false) => "Проигрывается",
+            (false, false) => "Пауза",
+        };
+        activity = activity.assets(
+            activity::Assets::new()
+                .large_image(cover.as_deref().unwrap_or(&fallback_cover))
+                .large_text(&title)
+                .small_image(&small_image)
+                .small_text(status),
+        );
+        if state.playing && state.duration > state.position {
             activity = activity.timestamps(
                 activity::Timestamps::new()
                     .start(now - state.position as i64)
@@ -785,6 +845,10 @@ impl Player {
                 self.state.playing = false;
                 self.state.loading = false;
                 self.wave = None;
+                self.wave_history = None;
+                self.wave_pending = None;
+                self.wave_retry = None;
+                self.resume_position = None;
                 self.state.wave = false;
                 self.state.position = 0.0;
                 self.state.duration = 0.0;
@@ -804,7 +868,63 @@ impl Player {
                 let tracks = self.api.search(query()?)?;
                 self.replace_queue(tracks, 0)?;
             }
-            "wave_start" => self.start_wave()?,
+            "wave_start" => self.start_wave(WaveStation::default(), Vec::new())?,
+            "wave_track" => {
+                let title = a["title"]
+                    .as_str()
+                    .unwrap_or("По треку")
+                    .chars()
+                    .take(120)
+                    .collect();
+                self.start_wave(
+                    WaveStation {
+                        seed_track: Some(track_id()?),
+                        title,
+                    },
+                    Vec::new(),
+                )?;
+            }
+            "wave_undo" => {
+                let history = self.wave_history.take().context("Нет прежней волны")?;
+                self.replace_queue(history.tracks, history.index)?;
+                self.wave = Some(history.wave);
+                self.state.wave = true;
+                self.autoplay = history.autoplay;
+                self.resume_position = Some(history.position);
+            }
+            "wave_shake" => {
+                let wave = self
+                    .wave
+                    .as_ref()
+                    .context("Сначала запустите Мою волну")?
+                    .clone();
+                let index = self
+                    .state
+                    .index
+                    .filter(|&index| index < self.state.queue.len())
+                    .context("Очередь волны пуста")?;
+                let station = wave.station.clone();
+                let history = WaveHistory {
+                    wave,
+                    tracks: self.state.queue.clone(),
+                    index,
+                    position: self.wave_position().map_or(0.0, |(_, position)| position),
+                    autoplay: self
+                        .sink
+                        .as_ref()
+                        .map_or(self.autoplay, |sink| !sink.is_paused()),
+                };
+                let exclude = self
+                    .state
+                    .queue
+                    .iter()
+                    .rev()
+                    .take(60)
+                    .map(|track| track.id.to_string())
+                    .collect();
+                self.start_wave(station, exclude)?;
+                self.wave_history = Some(history);
+            }
             "play_track" => {
                 let track = self.api.track(track_id()?)?;
                 self.replace_queue(vec![track], 0)?;
@@ -988,5 +1108,49 @@ mod like_state_tests {
         assert!(decoded.liked.contains(&123));
         assert!(decoded.liked.contains(&456));
         assert!(!decoded.liked.contains(&789));
+    }
+}
+
+#[cfg(test)]
+mod wave_history_tests {
+    use super::*;
+
+    #[test]
+    fn undo_restores_the_previous_session_queue_and_paused_position() {
+        let mut player = Player::new().unwrap();
+        let tracks: Vec<Track> = serde_json::from_value(json!([
+            {"id": 12, "title": "First"},
+            {"id": 34, "title": "Second", "durationMs": 60000}
+        ]))
+        .unwrap();
+        player.wave_history = Some(WaveHistory {
+            wave: Wave {
+                station: WaveStation {
+                    seed_track: Some(12),
+                    title: "First".into(),
+                },
+                session: "previous-session".into(),
+                batches: HashMap::from([(34, "previous-batch".into())]),
+            },
+            tracks,
+            index: 1,
+            position: 17.0,
+            autoplay: false,
+        });
+
+        player.command("wave_undo", &json!({})).unwrap();
+
+        let state = player.snapshot();
+        assert!(state.wave);
+        assert!(!state.wave_undo);
+        assert_eq!(state.wave_station.unwrap().seed_track, Some(12));
+        assert_eq!(player.wave.as_ref().unwrap().session, "previous-session");
+        assert_eq!(
+            state.queue.iter().map(|track| track.id).collect::<Vec<_>>(),
+            [12, 34]
+        );
+        assert_eq!(state.index, Some(1));
+        assert_eq!(player.resume_position, Some(17.0));
+        assert!(!player.autoplay);
     }
 }

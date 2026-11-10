@@ -76,6 +76,9 @@ struct App {
     tray: Option<crate::desktop::Tray>,
     quitting: bool,
     detail_track: Option<Track>,
+    detail_playback_id: Option<u64>,
+    recommendations: Vec<Track>,
+    recommendations_error: String,
     playlist_dialog: bool,
     playlist_title: String,
     create_track: Option<Track>,
@@ -208,6 +211,9 @@ impl App {
             tray,
             quitting: false,
             detail_track: None,
+            detail_playback_id: None,
+            recommendations: Vec::new(),
+            recommendations_error: String::new(),
             playlist_dialog: false,
             playlist_title: String::new(),
             create_track: None,
@@ -256,6 +262,9 @@ impl App {
                     | "play_track"
                     | "play_results"
                     | "wave_start"
+                    | "wave_track"
+                    | "wave_shake"
+                    | "wave_undo"
                     | "queue_add"
                     | "login"
                     | "logout"
@@ -294,6 +303,13 @@ impl App {
                         Err(error) => self.search_error = error,
                     },
                     "search" => {}
+                    "recommendations" => match tracks_from(v) {
+                        Ok(tracks) => {
+                            self.recommendations = tracks;
+                            self.recommendations_error.clear();
+                        }
+                        Err(error) => self.recommendations_error = error,
+                    },
                     "library" => match tracks_from(v) {
                         Ok(tracks) => {
                             self.status = if tracks.is_empty() {
@@ -348,6 +364,9 @@ impl App {
                         }
                     },
                     "login" => {
+                        self.recommendations.clear();
+                        self.recommendations_error.clear();
+                        self.send("recommendations", json!({}));
                         self.token.clear();
                         self.callback_url.clear();
                         self.browser_login = None;
@@ -361,6 +380,8 @@ impl App {
                         }
                     }
                     "logout" => {
+                        self.recommendations.clear();
+                        self.recommendations_error.clear();
                         self.library.clear();
                         self.playlists.clear();
                         self.opened_playlist = None;
@@ -393,6 +414,7 @@ impl App {
                 Ok(Err(e)) if matches!(name.as_str(), "login" | "logout") => {
                     self.account_status = e;
                 }
+                Ok(Err(e)) if name == "recommendations" => self.recommendations_error = e,
                 Ok(Err(e)) if name == "search" => {
                     if self.query.trim() == self.submitted_query {
                         self.search_error = e;
@@ -921,7 +943,7 @@ impl App {
                             |ui| {
                                 let cover = self.covers.draw(ui, track.cover(), 46.0);
                                 if cover.clicked() {
-                                    self.detail_track = Some(track.clone());
+                                    self.open_track_view(ui.ctx(), track);
                                 }
                                 self.track_menu(&cover, track);
                                 if control(
@@ -975,7 +997,7 @@ impl App {
                                             )
                                             .on_hover_text(&track.title);
                                         if title.clicked() {
-                                            self.detail_track = Some(track.clone());
+                                            self.open_track_view(ui.ctx(), track);
                                         }
                                         self.track_menu(&title, track);
                                         ui.horizontal(|ui| {
@@ -1133,20 +1155,27 @@ impl App {
     }
 
     fn home(&mut self, ui: &mut egui::Ui, s: &Snapshot) {
-        let height = (ui.available_height() * 0.80).clamp(310.0, 600.0);
+        let wave_busy = self.pending.iter().any(|(name, _)| {
+            matches!(
+                name.as_str(),
+                "wave_start" | "wave_track" | "wave_shake" | "wave_undo"
+            )
+        });
+        let active = s.wave && s.track.is_some();
+        let minimum_height = if active { 402.0 } else { 360.0 };
+        let height = (ui.available_height() * 0.80).clamp(minimum_height, 600.0);
         let (area, _) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), height),
             egui::Sense::hover(),
         );
         draw_wave(ui, area, s.wave && s.playing);
-        let active = s.wave && s.track.is_some();
         let heading = if active {
             s.track.as_ref().unwrap().artist()
         } else {
             "Моя волна".into()
         };
         let heading_rect = egui::Rect::from_min_max(
-            area.min + egui::vec2(24.0, height * 0.25),
+            area.min + egui::vec2(24.0, height * if active { 0.13 } else { 0.25 }),
             egui::pos2(area.right() - 24.0, area.top() + height * 0.57),
         );
         ui.scope_builder(
@@ -1157,11 +1186,14 @@ impl App {
                 ui.add(
                     egui::Label::new(
                         RichText::new(heading)
-                            .size((area.width() * 0.075).clamp(30.0, 64.0))
+                            .size(
+                                (area.width() * 0.075)
+                                    .clamp(28.0, if active { 56.0 } else { 64.0 }),
+                            )
                             .strong()
                             .color(Color32::WHITE),
                     )
-                    .wrap(),
+                    .truncate(),
                 );
             },
         );
@@ -1169,7 +1201,14 @@ impl App {
             ui.painter().text(
                 egui::pos2(area.center().x, area.top() + 24.0),
                 egui::Align2::CENTER_CENTER,
-                "МОЯ ВОЛНА",
+                if s.wave_station
+                    .as_ref()
+                    .is_some_and(|station| station.seed_track.is_some())
+                {
+                    "ВОЛНА ПО ТРЕКУ"
+                } else {
+                    "МОЯ ВОЛНА"
+                },
                 egui::FontId::proportional(13.0),
                 YELLOW,
             );
@@ -1190,8 +1229,7 @@ impl App {
                         self.send("previous", json!({}));
                     }
                 });
-                let pending = self.pending.iter().any(|(name, _)| name == "wave_start");
-                ui.add_enabled_ui(!pending, |ui| {
+                ui.add_enabled_ui(!wave_busy, |ui| {
                     if control(
                         ui,
                         if s.wave && s.playing {
@@ -1233,6 +1271,25 @@ impl App {
             },
         );
         if let Some(track) = s.track.as_ref().filter(|_| active) {
+            let size = (height * 0.33)
+                .clamp(128.0, 174.0)
+                .min((area.width() - 24.0).max(1.0));
+            let cover_rect = egui::Rect::from_center_size(
+                egui::pos2(area.center().x, area.bottom() - 136.0 - size * 0.5),
+                egui::vec2(size, size),
+            );
+            ui.scope_builder(
+                egui::UiBuilder::new()
+                    .max_rect(cover_rect)
+                    .layout(Layout::top_down(Align::Center)),
+                |ui| {
+                    let cover = self.covers.draw(ui, track.cover(), size);
+                    if cover.clicked() {
+                        self.open_track_view(ui.ctx(), track);
+                    }
+                    self.track_menu(&cover, track);
+                },
+            );
             let rect = egui::Rect::from_center_size(
                 egui::pos2(area.center().x, area.bottom() - 115.0),
                 egui::vec2((area.width() - 40.0).min(480.0), 24.0),
@@ -1246,10 +1303,27 @@ impl App {
                 )
                 .clicked()
             {
-                self.detail_track = Some(track.clone());
+                self.open_track_view(ui.ctx(), track);
             }
         }
         ui.advance_cursor_after_rect(area);
+        if active {
+            let (label, command) = if s.wave_undo {
+                ("Вернуть прежнюю", "wave_undo")
+            } else {
+                ("Встряхнуть волну", "wave_shake")
+            };
+            ui.vertical_centered(|ui| {
+                ui.add_enabled_ui(!wave_busy, |ui| {
+                    if ui
+                        .add_sized([164.0, 30.0], egui::Button::new(label))
+                        .clicked()
+                    {
+                        self.send(command, json!({}));
+                    }
+                });
+            });
+        }
     }
 
     fn track_menu(&mut self, response: &egui::Response, track: &Track) {
@@ -1270,7 +1344,14 @@ impl App {
     fn track_menu_contents(&mut self, ui: &mut egui::Ui, track: &Track) {
         ui.label(&track.title);
         if ui.button("Открыть трек").clicked() {
-            self.detail_track = Some(track.clone());
+            self.open_track_view(ui.ctx(), track);
+            ui.close();
+        }
+        if ui.button("Моя волна по треку").clicked() {
+            self.send(
+                "wave_track",
+                json!({"track_id": track.id, "title": track.title}),
+            );
             ui.close();
         }
         ui.menu_button("Добавить в плейлист", |ui| {
@@ -1318,29 +1399,78 @@ impl App {
         }
     }
 
+    fn open_track_view(&mut self, ctx: &Context, track: &Track) {
+        self.detail_playback_id = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .track
+            .as_ref()
+            .map(|t| t.id);
+        self.detail_track = Some(track.clone());
+        ctx.request_repaint();
+    }
+
+    fn close_track_view(&mut self, ctx: &Context) {
+        self.detail_track = None;
+        self.detail_playback_id = None;
+        ctx.request_repaint();
+    }
+
     fn recommendation_cards(&mut self, ui: &mut egui::Ui, s: &Snapshot) {
         ui.add_space(16.0);
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("Хочу рекомендации").size(22.0).strong());
-            if ui.button("Обновить волну").clicked() {
-                self.send("wave_start", json!({}));
+            if ui
+                .add_enabled(
+                    s.logged_in
+                        && !self
+                            .pending
+                            .iter()
+                            .any(|(name, _)| name == "recommendations"),
+                    egui::Button::new("Обновить"),
+                )
+                .clicked()
+            {
+                self.recommendations_error.clear();
+                self.send("recommendations", json!({}));
             }
         });
-        if s.queue.is_empty() {
-            ui.label("Запустите Мою волну — здесь появятся треки для вас.");
+        ui.small("Плейлист дня");
+        if !s.logged_in {
+            ui.label("Войдите, чтобы увидеть персональные рекомендации.");
+            return;
+        }
+        if !self.recommendations_error.is_empty() {
+            ui.small(&self.recommendations_error);
+        }
+        if self.recommendations.is_empty() {
+            if self
+                .pending
+                .iter()
+                .any(|(name, _)| name == "recommendations")
+            {
+                ui.spinner();
+            } else if self.recommendations_error.is_empty() {
+                ui.label("Плейлист дня пока пуст.");
+            }
+            return;
+        }
+        let tracks: Vec<_> = self
+            .recommendations
+            .iter()
+            .filter(|track| !s.wave || !s.queue.iter().any(|queued| queued.id == track.id))
+            .cloned()
+            .collect();
+        if tracks.is_empty() {
+            ui.label("Треки из этой подборки уже есть в текущей волне.");
             return;
         }
         ScrollArea::horizontal()
             .id_salt("recommendations")
             .show(ui, |ui| {
                 ui.horizontal_top(|ui| {
-                    for (index, track) in s
-                        .queue
-                        .iter()
-                        .enumerate()
-                        .skip(s.index.unwrap_or(0))
-                        .take(8)
-                    {
+                    for (index, track) in tracks.iter().enumerate() {
                         let response = Frame::new()
                             .fill(Color32::from_rgb(29, 28, 35))
                             .corner_radius(16)
@@ -1350,7 +1480,7 @@ impl App {
                                     ui.set_width(156.0);
                                     let cover = self.covers.draw(ui, track.cover(), 156.0);
                                     if cover.clicked() {
-                                        self.detail_track = Some(track.clone());
+                                        self.open_track_view(ui.ctx(), track);
                                     }
                                     self.track_menu(&cover, track);
                                     let title = ui
@@ -1362,7 +1492,7 @@ impl App {
                                         )
                                         .on_hover_text(&track.title);
                                     if title.clicked() {
-                                        self.detail_track = Some(track.clone());
+                                        self.open_track_view(ui.ctx(), track);
                                     }
                                     self.track_menu(&title, track);
                                     ui.add_sized(
@@ -1392,14 +1522,17 @@ impl App {
                                         )
                                         .clicked()
                                         {
-                                            self.send(
-                                                if active {
-                                                    if playing { "pause" } else { "play" }
-                                                } else {
-                                                    "queue_play"
-                                                },
-                                                json!({"index":index}),
-                                            );
+                                            if active {
+                                                self.send(
+                                                    if playing { "pause" } else { "play" },
+                                                    json!({}),
+                                                );
+                                            } else {
+                                                self.send(
+                                                    "play_results",
+                                                    json!({"tracks": tracks, "index": index}),
+                                                );
+                                            }
                                         }
                                         self.track_like(ui, s, track);
                                         self.more_menu(ui, track);
@@ -1438,19 +1571,46 @@ impl App {
         ui.painter().add(egui::Shape::mesh(mesh));
         ui.ctx().request_repaint_after(Duration::from_millis(66));
         ScrollArea::vertical().show(ui, |ui| {
-            if ui.button("← Назад").clicked() {
-                self.detail_track = None;
-            }
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                ui.add_space(12.0);
+                if control(
+                    ui,
+                    ControlIcon::Collapse,
+                    "Свернуть плеер (Esc) · На весь экран (F11)",
+                    false,
+                )
+                .clicked()
+                {
+                    self.close_track_view(ui.ctx());
+                }
+            });
+            let size = ((area.height() - 200.0) * 0.65)
+                .clamp(100.0, 460.0)
+                .min((ui.available_width() - 30.0).max(1.0));
+            ui.add_space(((area.height() - size - 240.0) * 0.5).max(8.0));
             ui.vertical_centered(|ui| {
-                let size = (area.height() - 190.0)
-                    .clamp(120.0, 360.0)
-                    .min(ui.available_width() - 30.0);
                 let cover = self.covers.draw(ui, track.cover(), size);
                 self.track_menu(&cover, track);
                 ui.add_space(14.0);
                 ui.label(RichText::new(&track.title).size(28.0).strong());
-                ui.label(RichText::new(track.artist()).size(18.0));
+                ui.label(
+                    RichText::new(track.artist())
+                        .size(18.0)
+                        .color(Color32::from_gray(225)),
+                );
                 ui.add_space(14.0);
+                if s.track
+                    .as_ref()
+                    .is_some_and(|current| current.id == track.id)
+                {
+                    let width = ui.available_width().min(480.0);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(width, 24.0),
+                        Layout::top_down(Align::Center),
+                        |ui| self.progress(ui, s),
+                    );
+                }
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 12.0;
                     ui.add_space(((ui.available_width() - 236.0) * 0.5).max(0.0));
@@ -1491,6 +1651,13 @@ impl App {
                     }
                     self.more_menu(ui, track);
                 });
+                if !self.status.is_empty() {
+                    ui.small(&self.status);
+                } else if !s.error.is_empty() {
+                    ui.small(&s.error);
+                } else if self.busy() || s.loading {
+                    ui.small("Загрузка…");
+                }
             });
         });
     }
@@ -1546,7 +1713,7 @@ impl App {
         });
     }
 
-    fn transport(&mut self, ui: &mut egui::Ui, s: &Snapshot) {
+    fn progress(&mut self, ui: &mut egui::Ui, s: &Snapshot) {
         ui.horizontal(|ui| {
             let position = self.seek.unwrap_or(s.position).clamp(0.0, s.duration);
             time_label(ui, position);
@@ -1565,7 +1732,10 @@ impl App {
             }
             time_label(ui, s.duration);
         });
+    }
 
+    fn transport(&mut self, ui: &mut egui::Ui, s: &Snapshot) {
+        self.progress(ui, s);
         if ui.available_width() < 860.0 {
             ui.horizontal(|ui| {
                 let info_width = (ui.available_width() - 165.0).max(115.0);
@@ -1628,7 +1798,7 @@ impl App {
             .draw(ui, s.track.as_ref().and_then(Track::cover), 42.0);
         if let Some(track) = &s.track {
             if cover.clicked() {
-                self.detail_track = Some(track.clone());
+                self.open_track_view(ui.ctx(), track);
             }
             self.track_menu(&cover, track);
         }
@@ -1659,7 +1829,7 @@ impl App {
                 );
                 if let Some(track) = &s.track {
                     if title.clicked() {
-                        self.detail_track = Some(track.clone());
+                        self.open_track_view(ui.ctx(), track);
                     }
                     self.track_menu(&title, track);
                 }
@@ -1914,6 +2084,10 @@ impl eframe::App for App {
         self.covers.poll(ctx);
         let snapshot = self.state.lock().unwrap_or_else(|e| e.into_inner()).clone();
         self.flush_volume(&snapshot);
+        if ctx.input(|input| input.key_pressed(Key::F11)) {
+            let fullscreen = ctx.input(|input| input.viewport().fullscreen.unwrap_or(false));
+            ctx.send_viewport_cmd(ViewportCommand::Fullscreen(!fullscreen));
+        }
         let search_shortcut = ctx.input(|input| {
             input.events.iter().any(|event| {
                 matches!(event, egui::Event::Key { key: Key::K, pressed: true, modifiers, .. }
@@ -1922,6 +2096,9 @@ impl eframe::App for App {
             })
         });
         if !self.mini && search_shortcut {
+            if self.detail_track.is_some() {
+                self.close_track_view(ctx);
+            }
             self.navigate(Page::Search, snapshot.logged_in);
             self.focus_search = true;
         }
@@ -1940,6 +2117,30 @@ impl eframe::App for App {
             Some(Key::Minus) => ctx.set_zoom_factor((ctx.zoom_factor() - 0.1).max(0.75)),
             Some(Key::Num0) => ctx.set_zoom_factor(1.0),
             _ => {}
+        }
+        if !self.pending.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+        if self.detail_track.is_some() {
+            if ctx.input(|input| input.key_pressed(Key::Escape)) && !self.playlist_dialog {
+                self.close_track_view(ctx);
+            } else {
+                let current = snapshot.track.as_ref();
+                let current_id = current.map(|track| track.id);
+                if self.detail_playback_id != current_id {
+                    self.detail_playback_id = current_id;
+                    if let Some(track) = current {
+                        self.detail_track = Some(track.clone());
+                    }
+                }
+                if let Some(track) = self.detail_track.clone() {
+                    egui::CentralPanel::default()
+                        .frame(Frame::new().fill(Color32::from_gray(14)))
+                        .show(ctx, |ui| self.track_detail(ui, &snapshot, &track));
+                    self.playlist_create_dialog(ctx);
+                    return;
+                }
+            }
         }
         egui::TopBottomPanel::bottom("player")
             .frame(
@@ -1978,10 +2179,6 @@ impl eframe::App for App {
             .frame(Frame::new().inner_margin(Margin::same(24)))
             .show(ctx, |ui| {
                 if self.mini {
-                    return;
-                }
-                if let Some(track) = self.detail_track.clone() {
-                    self.track_detail(ui, &snapshot, &track);
                     return;
                 }
                 match self.page {
@@ -2099,9 +2296,6 @@ impl eframe::App for App {
                 }
             });
         self.equalizer_window(ctx, snapshot.equalizer);
-        if !self.pending.is_empty() {
-            ctx.request_repaint_after(Duration::from_millis(100));
-        }
     }
 }
 
@@ -2276,6 +2470,7 @@ enum ControlIcon {
     Equalizer,
     Like,
     More,
+    Collapse,
 }
 
 fn time_label(ui: &mut egui::Ui, seconds: f64) {
@@ -2356,6 +2551,7 @@ fn paint_control(painter: &egui::Painter, center: egui::Pos2, color: Color32, ic
         ));
     };
     match icon {
+        ControlIcon::Collapse => line(&[(-7.0, -3.0), (0.0, 4.0), (7.0, -3.0)]),
         ControlIcon::More => {
             for x in [-5.5, 0.0, 5.5] {
                 painter.circle_filled(p(x, 0.0), 1.6, color);
@@ -2711,9 +2907,9 @@ mod card_layout_tests {
         let ctx = Context::default();
         let mut app = App::new_internal(&ctx, false, None);
         let track: Track = serde_json::from_value(json!({"id":42,"title":"Test song","artists":[{"id":1,"name":"Test artist"}],"durationMs":120000})).unwrap();
+        app.recommendations = vec![track];
         let snapshot = Snapshot {
-            queue: vec![track],
-            index: Some(0),
+            logged_in: true,
             ..Default::default()
         };
         let output = ctx.run(
