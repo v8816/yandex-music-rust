@@ -157,6 +157,7 @@ struct Player {
 type ReadTask = (Api, String, Value, mpsc::Sender<Reply>);
 
 struct Wave {
+    seed_track: Option<u64>,
     session: String,
     batches: HashMap<u64, String>,
 }
@@ -178,6 +179,7 @@ impl Player {
                         .search(args["query"].as_str().unwrap_or_default())
                         .map(|tracks| json!(tracks)),
                     "library" => api.library().map(|tracks| json!(tracks)),
+                    "recommendations" => api.recommendations().map(|tracks| json!(tracks)),
                     "playlists" => api.playlists().map(|playlists| json!(playlists)),
                     "playlist_create" => {
                         api.create_playlist(args["title"].as_str().unwrap_or_default())
@@ -339,6 +341,7 @@ impl Player {
                 }
             },
             "library" => ("library", json!({})),
+            "recommendations" => ("recommendations", json!({})),
             "playlists" => ("playlists", json!({})),
             "playlist_add" => ("playlist_add", job.args.clone()),
             "playlist_create" => ("playlist_create", job.args.clone()),
@@ -430,12 +433,12 @@ impl Player {
         ));
     }
 
-    fn start_wave(&mut self) -> Result<()> {
+    fn start_wave(&mut self, seed_track: Option<u64>, exclude: Vec<String>) -> Result<()> {
         ensure!(
             self.state.logged_in,
             "Войдите в Яндекс ID, чтобы запустить Мою волну"
         );
-        let response = self.api.wave_start()?;
+        let response = self.api.wave_start(seed_track, exclude)?;
         let session = response
             .radio_session_id
             .clone()
@@ -455,7 +458,11 @@ impl Player {
         self.replace_queue(tracks, 0)?;
         self.wave_pending = None;
         self.wave_retry = None;
-        self.wave = Some(Wave { session, batches });
+        self.wave = Some(Wave {
+            seed_track,
+            session,
+            batches,
+        });
         self.state.wave = true;
         self.wave_event("radioStarted", first, None);
         Ok(())
@@ -473,6 +480,7 @@ impl Player {
             return;
         };
         let session = wave.session.clone();
+        let seed_track = wave.seed_track;
         let queue = self
             .state
             .queue
@@ -488,7 +496,7 @@ impl Player {
         let (tx, rx) = mpsc::channel();
         let key = session.clone();
         thread::spawn(move || {
-            let _ = tx.send(api.wave_more(&key, queue));
+            let _ = tx.send(api.wave_more(&key, queue, seed_track));
         });
         self.wave_pending = Some((session, rx));
         self.wave_retry = Some(Instant::now());
@@ -521,9 +529,11 @@ impl Player {
             .take(60)
             .map(|track| track.id.to_string())
             .collect::<Vec<_>>();
-        let batch = self
-            .api
-            .wave_more(&wave.session, queue.into_iter().rev().collect())?;
+        let batch = self.api.wave_more(
+            &wave.session,
+            queue.into_iter().rev().collect(),
+            wave.seed_track,
+        )?;
         self.append_wave(batch)
     }
 
@@ -628,7 +638,7 @@ impl Player {
             }
             changed = true;
         }
-        if self.state.rpc && self.state.playing && self.discord.is_none() {
+        if self.state.rpc && self.sink.is_some() && self.discord.is_none() {
             self.update_rpc();
         }
         changed
@@ -647,7 +657,13 @@ impl Player {
             self.clear_rpc();
             return;
         }
-        let Some(track) = state.track.filter(|_| state.playing) else {
+        if state.loading {
+            return;
+        }
+        let Some(track) = state
+            .track
+            .filter(|_| self.sink.as_ref().is_some_and(|sink| !sink.empty()))
+        else {
             if let Some(rpc) = &mut self.discord
                 && rpc.clear_activity().is_err()
             {
@@ -695,14 +711,29 @@ impl Player {
                 activity::Button::new("Открыть в приложении", &app_link),
                 activity::Button::new("Открыть на сайте", &link),
             ]);
-        if let Some(cover) = &cover {
-            activity = activity.assets(
-                activity::Assets::new()
-                    .large_image(cover)
-                    .large_text(&title),
-            );
-        }
-        if state.duration > state.position {
+        const ASSETS: &str =
+            "https://raw.githubusercontent.com/v8816/yandex-music-rust/dev/desktop-polish/assets";
+        let icon = if state.playing {
+            "rpc-playing.png"
+        } else {
+            "rpc-paused.png"
+        };
+        let small_image = format!("{ASSETS}/{icon}");
+        let fallback_cover = format!("{ASSETS}/app.png");
+        let status = match (state.playing, state.rpc_settings.language == "en") {
+            (true, true) => "Playing",
+            (false, true) => "Paused",
+            (true, false) => "Проигрывается",
+            (false, false) => "Пауза",
+        };
+        activity = activity.assets(
+            activity::Assets::new()
+                .large_image(cover.as_deref().unwrap_or(&fallback_cover))
+                .large_text(&title)
+                .small_image(&small_image)
+                .small_text(status),
+        );
+        if state.playing && state.duration > state.position {
             activity = activity.timestamps(
                 activity::Timestamps::new()
                     .start(now - state.position as i64)
@@ -804,7 +835,24 @@ impl Player {
                 let tracks = self.api.search(query()?)?;
                 self.replace_queue(tracks, 0)?;
             }
-            "wave_start" => self.start_wave()?,
+            "wave_start" => self.start_wave(None, Vec::new())?,
+            "wave_track" => self.start_wave(Some(track_id()?), Vec::new())?,
+            "wave_shake" => {
+                let seed_track = self
+                    .wave
+                    .as_ref()
+                    .context("Сначала запустите Мою волну")?
+                    .seed_track;
+                let exclude = self
+                    .state
+                    .queue
+                    .iter()
+                    .rev()
+                    .take(60)
+                    .map(|track| track.id.to_string())
+                    .collect();
+                self.start_wave(seed_track, exclude)?;
+            }
             "play_track" => {
                 let track = self.api.track(track_id()?)?;
                 self.replace_queue(vec![track], 0)?;
