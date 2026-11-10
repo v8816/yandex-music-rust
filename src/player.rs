@@ -58,8 +58,6 @@ pub struct Snapshot {
     pub wave_undo: bool,
     #[serde(default)]
     pub wave_station: Option<WaveStation>,
-    #[serde(default)]
-    pub pinned_wave: Option<WaveStation>,
     pub equalizer: equalizer::Settings,
     pub logged_in: bool,
     #[serde(skip_serializing, default)]
@@ -225,7 +223,6 @@ impl Player {
                 repeat: "off".into(),
                 rpc: true,
                 rpc_settings: crate::preferences::RpcSettings::load(),
-                pinned_wave: WaveStation::load_pin(),
                 ..Snapshot::default()
             },
             stream: None,
@@ -886,28 +883,6 @@ impl Player {
                     },
                     Vec::new(),
                 )?;
-            }
-            "wave_pin" => {
-                let station = self
-                    .wave
-                    .as_ref()
-                    .context("Сначала запустите Мою волну")?
-                    .station
-                    .clone();
-                WaveStation::save_pin(Some(&station)).context("Не удалось закрепить волну")?;
-                self.state.pinned_wave = Some(station);
-            }
-            "wave_unpin" => {
-                WaveStation::save_pin(None).context("Не удалось открепить волну")?;
-                self.state.pinned_wave = None;
-            }
-            "wave_pinned" => {
-                let station = self
-                    .state
-                    .pinned_wave
-                    .clone()
-                    .context("Нет закреплённой волны")?;
-                self.start_wave(station, Vec::new())?;
             }
             "wave_undo" => {
                 let history = self.wave_history.take().context("Нет прежней волны")?;

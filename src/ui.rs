@@ -265,7 +265,6 @@ impl App {
                     | "wave_track"
                     | "wave_shake"
                     | "wave_undo"
-                    | "wave_pinned"
                     | "queue_add"
                     | "login"
                     | "logout"
@@ -1159,38 +1158,24 @@ impl App {
         let wave_busy = self.pending.iter().any(|(name, _)| {
             matches!(
                 name.as_str(),
-                "wave_start" | "wave_track" | "wave_shake" | "wave_undo" | "wave_pinned"
+                "wave_start" | "wave_track" | "wave_shake" | "wave_undo"
             )
         });
-        if let Some(pin) = &s.pinned_wave {
-            ui.horizontal_wrapped(|ui| {
-                ui.small("Закреплено");
-                ui.label(RichText::new(&pin.title).strong());
-                if ui
-                    .add_enabled(s.logged_in && !wave_busy, egui::Button::new("Слушать"))
-                    .clicked()
-                {
-                    self.send("wave_pinned", json!({}));
-                }
-                if ui.button("Открепить").clicked() {
-                    self.send("wave_unpin", json!({}));
-                }
-            });
-        }
-        let height = (ui.available_height() * 0.80).clamp(360.0, 600.0);
+        let active = s.wave && s.track.is_some();
+        let minimum_height = if active { 402.0 } else { 360.0 };
+        let height = (ui.available_height() * 0.80).clamp(minimum_height, 600.0);
         let (area, _) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), height),
             egui::Sense::hover(),
         );
         draw_wave(ui, area, s.wave && s.playing);
-        let active = s.wave && s.track.is_some();
         let heading = if active {
             s.track.as_ref().unwrap().artist()
         } else {
             "Моя волна".into()
         };
         let heading_rect = egui::Rect::from_min_max(
-            area.min + egui::vec2(24.0, height * if active { 0.16 } else { 0.25 }),
+            area.min + egui::vec2(24.0, height * if active { 0.13 } else { 0.25 }),
             egui::pos2(area.right() - 24.0, area.top() + height * 0.57),
         );
         ui.scope_builder(
@@ -1286,7 +1271,9 @@ impl App {
             },
         );
         if let Some(track) = s.track.as_ref().filter(|_| active) {
-            let size = (height * 0.22).clamp(80.0, 108.0);
+            let size = (height * 0.33)
+                .clamp(128.0, 174.0)
+                .min((area.width() - 24.0).max(1.0));
             let cover_rect = egui::Rect::from_center_size(
                 egui::pos2(area.center().x, area.bottom() - 136.0 - size * 0.5),
                 egui::vec2(size, size),
@@ -1321,32 +1308,20 @@ impl App {
         }
         ui.advance_cursor_after_rect(area);
         if active {
-            let pinned = s.wave_station.is_some() && s.wave_station == s.pinned_wave;
-            ui.horizontal_wrapped(|ui| {
-                if ui
-                    .add_enabled(!wave_busy, egui::Button::new("Встряхнуть волну"))
-                    .clicked()
-                {
-                    self.send("wave_shake", json!({}));
-                }
-                if s.wave_undo
-                    && ui
-                        .add_enabled(!wave_busy, egui::Button::new("Вернуть прежнюю"))
+            let (label, command) = if s.wave_undo {
+                ("Вернуть прежнюю", "wave_undo")
+            } else {
+                ("Встряхнуть волну", "wave_shake")
+            };
+            ui.vertical_centered(|ui| {
+                ui.add_enabled_ui(!wave_busy, |ui| {
+                    if ui
+                        .add_sized([164.0, 30.0], egui::Button::new(label))
                         .clicked()
-                {
-                    self.send("wave_undo", json!({}));
-                }
-                let label = if pinned {
-                    "Закреплена"
-                } else {
-                    "Закрепить"
-                };
-                if ui
-                    .add_enabled(!wave_busy && !pinned, egui::Button::new(label))
-                    .clicked()
-                {
-                    self.send("wave_pin", json!({}));
-                }
+                    {
+                        self.send(command, json!({}));
+                    }
+                });
             });
         }
     }

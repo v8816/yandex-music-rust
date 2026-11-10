@@ -69,28 +69,6 @@ impl Default for WaveStation {
     }
 }
 
-impl WaveStation {
-    fn path() -> std::path::PathBuf {
-        RpcSettings::path().with_file_name("pinned-wave.json")
-    }
-
-    pub fn load_pin() -> Option<Self> {
-        std::fs::read(Self::path())
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-    }
-
-    pub fn save_pin(station: Option<&Self>) -> anyhow::Result<()> {
-        let path = Self::path();
-        let dir = path.parent().expect("preferences directory");
-        std::fs::create_dir_all(dir)?;
-        let mut temp = tempfile::NamedTempFile::new_in(dir)?;
-        serde_json::to_writer(&mut temp, &station)?;
-        temp.persist(path)?;
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
