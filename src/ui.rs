@@ -1539,19 +1539,28 @@ impl App {
         ui.painter().add(egui::Shape::mesh(mesh));
         ui.ctx().request_repaint_after(Duration::from_millis(66));
         ScrollArea::vertical().show(ui, |ui| {
-            if control(ui, ControlIcon::Collapse, "Свернуть плеер (Esc)", false).clicked()
-            {
-                self.close_track_view(ui.ctx());
-            }
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                ui.add_space(12.0);
+                if control(ui, ControlIcon::Collapse, "Свернуть плеер (Esc)", false).clicked()
+                {
+                    self.close_track_view(ui.ctx());
+                }
+            });
+            let size = ((area.height() - 200.0) * 0.65)
+                .clamp(100.0, 460.0)
+                .min((ui.available_width() - 30.0).max(1.0));
+            ui.add_space(((area.height() - size - 240.0) * 0.5).max(8.0));
             ui.vertical_centered(|ui| {
-                let size = (area.height() - 190.0)
-                    .clamp(120.0, 360.0)
-                    .min(ui.available_width() - 30.0);
                 let cover = self.covers.draw(ui, track.cover(), size);
                 self.track_menu(&cover, track);
                 ui.add_space(14.0);
                 ui.label(RichText::new(&track.title).size(28.0).strong());
-                ui.label(RichText::new(track.artist()).size(18.0));
+                ui.label(
+                    RichText::new(track.artist())
+                        .size(18.0)
+                        .color(Color32::from_gray(225)),
+                );
                 ui.add_space(14.0);
                 if s.track
                     .as_ref()
