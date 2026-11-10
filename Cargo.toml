@@ -1,6 +1,6 @@
 [package]
 name = "yandex-music-rust"
-version = "0.2.7"
+version = "0.2.8"
 edition = "2024"
 autobins = false
 
@@ -27,6 +27,11 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 rodio = { version = "0.21.1", default-features = false, features = ["wav"] }
 
 [target.'cfg(windows)'.dependencies]
+bytemuck = "1"
+egui_software_backend = { version = "0.0.2", default-features = false, features = ["std"] }
+egui-winit = { version = "0.33", default-features = false, features = ["clipboard", "links"] }
+softbuffer = { version = "0.4", default-features = false }
+winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
 tray-icon = "0.21"
 raw-window-handle = "0.6"
 windows = { version = "0.54", features = [

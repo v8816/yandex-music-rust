@@ -34,7 +34,7 @@ enum Page {
     Settings,
 }
 
-struct App {
+pub(crate) struct App {
     tx: SyncSender<Job>,
     state: Arc<Mutex<Snapshot>>,
     page: Page,
@@ -84,14 +84,20 @@ struct App {
     create_track: Option<Track>,
 }
 
-pub fn run() -> eframe::Result {
+pub fn run() -> anyhow::Result<()> {
+    let viewport = ViewportBuilder::default()
+        .with_title("Яндекс Музыка · Rust")
+        .with_icon(crate::desktop::icon())
+        .with_inner_size([1060.0, 710.0])
+        .with_min_inner_size([560.0, 480.0]);
+    #[cfg(windows)]
+    if !std::env::args().any(|arg| arg == "--gpu") {
+        return crate::software_window::run(viewport);
+    }
     eframe::run_native(
         "Яндекс Музыка · Rust",
         eframe::NativeOptions {
-            viewport: ViewportBuilder::default()
-                .with_icon(crate::desktop::icon())
-                .with_inner_size([1060.0, 710.0])
-                .with_min_inner_size([560.0, 480.0]),
+            viewport,
             ..Default::default()
         },
         Box::new(|cc| {
@@ -108,10 +114,11 @@ pub fn run() -> eframe::Result {
             Ok(Box::new(App::new_internal(&cc.egui_ctx, true, window)))
         }),
     )
+    .map_err(|error| anyhow::anyhow!("{error}"))
 }
 
 impl App {
-    fn new_internal(ctx: &Context, connect: bool, window: Option<isize>) -> Self {
+    pub(crate) fn new_internal(ctx: &Context, connect: bool, window: Option<isize>) -> Self {
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = Color32::from_rgb(17, 17, 20);
         visuals.extreme_bg_color = Color32::from_gray(13);
@@ -2081,6 +2088,12 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        App::update(self, ctx);
+    }
+}
+
+impl App {
+    pub(crate) fn update(&mut self, ctx: &Context) {
         #[cfg(windows)]
         {
             if self.tray.is_some()
