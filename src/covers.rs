@@ -31,12 +31,8 @@ impl Covers {
     pub fn new(ctx: &Context) -> Self {
         let (requests, incoming) = mpsc::sync_channel::<String>(32);
         let incoming = Arc::new(Mutex::new(incoming));
-        let (loaded, results) = mpsc::sync_channel(32);
-        let client = Client::builder()
-            .timeout(Duration::from_secs(8))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .ok();
+        let (loaded, results) = mpsc::sync_channel(4);
+        let client = crate::api::http_client().ok();
         for _ in 0..2 {
             let (incoming, loaded, ctx, client) = (
                 incoming.clone(),
@@ -98,6 +94,11 @@ impl Covers {
     }
 
     pub fn draw(&mut self, ui: &mut egui::Ui, uri: Option<&str>, size: f32) -> egui::Response {
+        let (rect, response) =
+            ui.allocate_exact_size(egui::Vec2::splat(size), egui::Sense::click());
+        if !ui.is_rect_visible(rect) {
+            return response;
+        }
         let large_uri = if size >= 200.0 {
             uri.map(|uri| uri.replace("%%", "400x400"))
         } else {
@@ -107,8 +108,6 @@ impl Covers {
             .as_deref()
             .or(uri)
             .and_then(|uri| self.texture(ui.ctx(), uri));
-        let (rect, response) =
-            ui.allocate_exact_size(egui::Vec2::splat(size), egui::Sense::click());
         if let Some(id) = texture {
             let image = egui::Image::new((id, rect.size())).corner_radius(8);
             image.paint_at(ui, rect);
@@ -197,6 +196,7 @@ pub(crate) fn cover_url(uri: &str) -> Option<Url> {
 fn download(client: &Client, uri: &str) -> Option<ColorImage> {
     let response = client
         .get(cover_url(uri)?)
+        .timeout(Duration::from_secs(8))
         .send()
         .ok()?
         .error_for_status()

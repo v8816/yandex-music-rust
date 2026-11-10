@@ -49,7 +49,7 @@ pub struct Snapshot {
     pub duration: f64,
     pub volume: f32,
     pub codec: String,
-    pub queue: Vec<Track>,
+    pub queue: Arc<Vec<Track>>,
     pub index: Option<usize>,
     pub repeat: String,
     pub shuffle: bool,
@@ -64,7 +64,7 @@ pub struct Snapshot {
     pub account_name: String,
     pub rpc: bool,
     #[serde(default)]
-    pub liked: HashSet<u64>,
+    pub liked: Arc<HashSet<u64>>,
     #[serde(default)]
     pub rpc_settings: crate::preferences::RpcSettings,
     pub lossless: bool,
@@ -89,15 +89,21 @@ pub fn start(
         };
         let (media_tx, media_rx) = mpsc::sync_channel::<Job>(8);
         #[cfg(windows)]
-        let mut media =
-            window.and_then(|hwnd| crate::media_session::Session::new(hwnd, media_tx).ok());
+        let (mut media, mut media_window) = (None, window);
         #[cfg(not(windows))]
         let _ = (window, media_tx);
         let mut publish = |player: &Player| {
             let snapshot = player.snapshot();
             #[cfg(windows)]
-            if let Some(media) = &mut media {
-                media.update(&snapshot);
+            {
+                if snapshot.track.is_some()
+                    && let Some(hwnd) = media_window.take()
+                {
+                    media = crate::media_session::Session::new(hwnd, media_tx.clone()).ok();
+                }
+                if let Some(media) = &mut media {
+                    media.update(&snapshot);
+                }
             }
             *published.lock().unwrap() = snapshot;
         };
@@ -172,7 +178,7 @@ struct Wave {
 
 struct WaveHistory {
     wave: Wave,
-    tracks: Vec<Track>,
+    tracks: Arc<Vec<Track>>,
     index: usize,
     position: f64,
     autoplay: bool,
@@ -413,7 +419,8 @@ impl Player {
         Ok(())
     }
 
-    fn replace_queue(&mut self, tracks: Vec<Track>, index: usize) -> Result<()> {
+    fn replace_queue(&mut self, tracks: impl Into<Arc<Vec<Track>>>, index: usize) -> Result<()> {
+        let tracks = tracks.into();
         let track = tracks.get(index).context("Трек не найден")?.clone();
         let old = self.wave_position();
         self.state.queue = tracks;
@@ -594,10 +601,11 @@ impl Player {
         for track in &tracks {
             wave.batches.insert(track.id, batch_id.clone());
         }
-        self.state.queue.extend(tracks);
+        let queue = Arc::make_mut(&mut self.state.queue);
+        queue.extend(tracks);
         if let Some(index) = self.state.index.as_mut() {
             let excess = index.saturating_sub(120);
-            for track in self.state.queue.drain(..excess) {
+            for track in queue.drain(..excess) {
                 wave.batches.remove(&track.id);
             }
             *index -= excess;
@@ -823,7 +831,7 @@ impl Player {
                     .context("Введите OAuth-токен")?;
                 self.state.account_name = self.api.login(token.to_owned())?;
                 self.state.logged_in = true;
-                self.state.liked = self.api.liked_ids().unwrap_or_default();
+                self.state.liked = Arc::new(self.api.liked_ids().unwrap_or_default());
                 let stored = if a["remember"].as_bool() == Some(true) {
                     crate::auth::save(token)
                 } else if a["remember"].as_bool() == Some(false) {
@@ -840,7 +848,7 @@ impl Player {
                 self.sink = None;
                 self.stream = None;
                 self.state.track = None;
-                self.state.queue.clear();
+                self.state.queue = Arc::default();
                 self.state.index = None;
                 self.state.playing = false;
                 self.state.loading = false;
@@ -857,7 +865,7 @@ impl Player {
                 self.api.logout();
                 self.state.logged_in = false;
                 self.state.account_name.clear();
-                self.state.liked.clear();
+                self.state.liked = Arc::default();
                 self.update_rpc();
                 if let Some(error) = storage_error {
                     self.state.error =
@@ -934,7 +942,10 @@ impl Player {
                 let index = a["index"].as_u64().context("Укажите позицию")? as usize;
                 self.replace_queue(tracks, index)?;
             }
-            "queue_add" => self.state.queue.push(self.api.track(track_id()?)?),
+            "queue_add" => {
+                let track = self.api.track(track_id()?)?;
+                Arc::make_mut(&mut self.state.queue).push(track);
+            }
             "queue_play" => self.select(a["index"].as_u64().context("Укажите позицию")? as usize)?,
             "queue_remove" => {
                 let index = a["index"].as_u64().context("Укажите позицию")? as usize;
@@ -943,7 +954,7 @@ impl Player {
                     Some(index) != self.state.index,
                     "Сначала переключите текущий трек"
                 );
-                self.state.queue.remove(index);
+                Arc::make_mut(&mut self.state.queue).remove(index);
                 if let Some(current) = self
                     .state
                     .index
@@ -1019,9 +1030,9 @@ impl Player {
                 };
                 self.api.like(id, name == "like")?;
                 if name == "like" {
-                    self.state.liked.insert(id);
+                    Arc::make_mut(&mut self.state.liked).insert(id);
                 } else {
-                    self.state.liked.remove(&id);
+                    Arc::make_mut(&mut self.state.liked).remove(&id);
                 }
             }
             "repeat" => {
@@ -1102,7 +1113,7 @@ mod like_state_tests {
     #[test]
     fn snapshot_contains_all_liked_tracks_not_only_the_current_one() {
         let mut snapshot = super::Snapshot::default();
-        snapshot.liked.extend([123, 456]);
+        std::sync::Arc::make_mut(&mut snapshot.liked).extend([123, 456]);
         let decoded: super::Snapshot =
             serde_json::from_value(serde_json::to_value(snapshot).unwrap()).unwrap();
         assert!(decoded.liked.contains(&123));
@@ -1132,7 +1143,7 @@ mod wave_history_tests {
                 session: "previous-session".into(),
                 batches: HashMap::from([(34, "previous-batch".into())]),
             },
-            tracks,
+            tracks: Arc::new(tracks),
             index: 1,
             position: 17.0,
             autoplay: false,

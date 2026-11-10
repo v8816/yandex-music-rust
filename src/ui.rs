@@ -1162,13 +1162,19 @@ impl App {
             )
         });
         let active = s.wave && s.track.is_some();
+        let track_wave = s.wave
+            && s.wave_station
+                .as_ref()
+                .is_some_and(|station| station.seed_track.is_some());
         let minimum_height = if active { 402.0 } else { 360.0 };
         let height = (ui.available_height() * 0.80).clamp(minimum_height, 600.0);
         let (area, _) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), height),
             egui::Sense::hover(),
         );
-        draw_wave(ui, area, s.wave && s.playing);
+        if ui.is_rect_visible(area) {
+            draw_wave(ui, area, s.wave && s.playing);
+        }
         let heading = if active {
             s.track.as_ref().unwrap().artist()
         } else {
@@ -1201,10 +1207,7 @@ impl App {
             ui.painter().text(
                 egui::pos2(area.center().x, area.top() + 24.0),
                 egui::Align2::CENTER_CENTER,
-                if s.wave_station
-                    .as_ref()
-                    .is_some_and(|station| station.seed_track.is_some())
-                {
+                if track_wave {
                     "ВОЛНА ПО ТРЕКУ"
                 } else {
                     "МОЯ ВОЛНА"
@@ -1307,7 +1310,7 @@ impl App {
             }
         }
         ui.advance_cursor_after_rect(area);
-        if active {
+        if active || track_wave {
             let (label, command) = if s.wave_undo {
                 ("Вернуть прежнюю", "wave_undo")
             } else {
@@ -1315,9 +1318,17 @@ impl App {
             };
             ui.vertical_centered(|ui| {
                 ui.add_enabled_ui(!wave_busy, |ui| {
-                    if ui
-                        .add_sized([164.0, 30.0], egui::Button::new(label))
-                        .clicked()
+                    if track_wave
+                        && ui
+                            .add_sized([200.0, 30.0], egui::Button::new("Вернуться в Мою волну"))
+                            .clicked()
+                    {
+                        self.send("wave_start", json!({}));
+                    }
+                    if active
+                        && ui
+                            .add_sized([164.0, 30.0], egui::Button::new(label))
+                            .clicked()
                     {
                         self.send(command, json!({}));
                     }
@@ -2902,6 +2913,79 @@ mod card_layout_tests {
             _ => {}
         }
     }
+    #[test]
+    fn track_wave_can_return_to_personal_wave_independently_of_shake_undo() {
+        let ctx = Context::default();
+        let mut app = App::new_internal(&ctx, false, None);
+        let (tx, jobs) = std::sync::mpsc::sync_channel(1);
+        app.tx = tx;
+        let mut snapshot = Snapshot {
+            wave: true,
+            wave_undo: true,
+            logged_in: true,
+            track: Some(serde_json::from_value(json!({"id": 42, "title": "Test"})).unwrap()),
+            wave_station: Some(crate::preferences::WaveStation {
+                seed_track: Some(42),
+                title: "Test".into(),
+            }),
+            ..Default::default()
+        };
+        let mut render = |snapshot: &Snapshot, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(560.0, 620.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .show(ctx, |ui| app.home(ui, snapshot))
+                        .inner
+                },
+            )
+        };
+        let mut texts = vec![];
+        for shape in render(&snapshot, vec![]).shapes {
+            text_shapes(&shape.shape, &mut texts);
+        }
+        assert!(texts.iter().any(|(text, _, _)| text == "Вернуть прежнюю"));
+        let pos = texts
+            .iter()
+            .find(|(text, _, _)| text == "Вернуться в Мою волну")
+            .expect("return button is visible on the track station")
+            .2
+            .center();
+        for pressed in [true, false] {
+            render(
+                &snapshot,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        assert_eq!(jobs.try_recv().unwrap().name, "wave_start");
+
+        snapshot.wave_station = Some(crate::preferences::WaveStation::default());
+        texts.clear();
+        for shape in render(&snapshot, vec![]).shapes {
+            text_shapes(&shape.shape, &mut texts);
+        }
+        assert!(
+            !texts
+                .iter()
+                .any(|(text, _, _)| text == "Вернуться в Мою волну")
+        );
+    }
+
     #[test]
     fn recommendation_keeps_title_and_artist_below_cover_at_minimum_width() {
         let ctx = Context::default();
