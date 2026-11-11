@@ -9,6 +9,8 @@ mod media;
 mod media_session;
 mod player;
 mod preferences;
+#[cfg(windows)]
+mod software_window;
 pub mod stream;
 pub mod ui;
 mod worker;

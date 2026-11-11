@@ -1,6 +1,6 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
-fn main() -> eframe::Result {
+fn main() -> anyhow::Result<()> {
     if std::env::args().nth(1).as_deref() == Some("--mcp") {
         let result = (|| -> anyhow::Result<()> {
             let port = std::env::args()

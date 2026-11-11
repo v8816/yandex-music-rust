@@ -9,7 +9,7 @@ use sha2::Sha256;
 use std::{
     collections::HashMap,
     io::Read,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -266,14 +266,26 @@ impl WaveBatch {
     }
 }
 
+pub(crate) fn http_client() -> Result<Client> {
+    static CLIENT: OnceLock<Result<Client, reqwest::Error>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            Client::builder()
+                .timeout(Duration::from_secs(25))
+                .connect_timeout(Duration::from_secs(5))
+                .pool_max_idle_per_host(2)
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+        })
+        .as_ref()
+        .cloned()
+        .map_err(|error| anyhow::anyhow!("Не удалось создать HTTP-клиент: {error}"))
+}
+
 impl Api {
     pub fn new() -> Result<Self> {
         Ok(Self {
-            http: Client::builder()
-                .timeout(Duration::from_secs(25))
-                .connect_timeout(Duration::from_secs(5))
-                .redirect(reqwest::redirect::Policy::none())
-                .build()?,
+            http: http_client()?,
             token: String::new(),
             uid: None,
         })
@@ -313,11 +325,10 @@ impl Api {
             .send()
             .context("Нет связи с API Яндекс Музыки")?;
         let status = response.status();
-        let text = response.text().unwrap_or_default();
-        let body: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        let mut body: Value = response.json().unwrap_or(Value::Null);
         ensure!(status.is_success(), "{}", service_error(status, &body));
         ensure!(!body.is_null(), "Не удалось прочитать ответ Яндекс Музыки");
-        Ok(body.get("result").cloned().unwrap_or(body))
+        Ok(body.get_mut("result").map(Value::take).unwrap_or(body))
     }
 
     pub fn wave_start(&self, seed_track: Option<u64>, queue: Vec<String>) -> Result<WaveBatch> {
@@ -506,13 +517,13 @@ impl Api {
                 .send()
                 .context("Не удалось получить треки")?;
             let status = response.status();
-            let body: Value = response.json().unwrap_or(Value::Null);
+            let mut body: Value = response.json().unwrap_or(Value::Null);
             ensure!(
                 status.is_success(),
                 "Не удалось получить треки: {}",
                 service_error(status, &body)
             );
-            let result = body.get("result").cloned();
+            let result = body.get_mut("result").map(Value::take);
             tracks.extend(tracks_from(result.unwrap_or(body)));
         }
         Ok(tracks)
