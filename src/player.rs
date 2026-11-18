@@ -1,9 +1,10 @@
 use crate::api::{Api, Track};
 use crate::equalizer::{self, Equalized};
 use crate::preferences::WaveStation;
+use crate::rpc::Client as DiscordIpcClient;
 use crate::worker::{Loaded, Loader};
 use anyhow::{Context, Result, bail, ensure};
-use discord_rich_presence::{DiscordIpc, DiscordIpcClient, activity};
+use discord_rich_presence::{DiscordIpc, activity};
 use rodio::{Decoder, OutputStream, OutputStreamBuilder, Sink, Source};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -63,6 +64,8 @@ pub struct Snapshot {
     #[serde(skip_serializing, default)]
     pub account_name: String,
     pub rpc: bool,
+    #[serde(default)]
+    pub rpc_status: String,
     #[serde(default)]
     pub liked: Arc<HashSet<u64>>,
     #[serde(default)]
@@ -682,6 +685,7 @@ impl Player {
     }
 
     fn clear_rpc(&mut self) {
+        self.state.rpc_status.clear();
         if let Some(mut rpc) = self.discord.take() {
             let _ = rpc.clear_activity();
             let _ = rpc.close();
@@ -716,10 +720,16 @@ impl Player {
                 return;
             }
             self.last_rpc_attempt = Some(Instant::now());
-            if let Ok(mut rpc) = DiscordIpcClient::new("1124055337234858005")
-                && rpc.connect().is_ok()
-            {
-                self.discord = Some(rpc);
+            let result = DiscordIpcClient::new("1124055337234858005").and_then(|mut rpc| {
+                rpc.connect()?;
+                Ok(rpc)
+            });
+            match result {
+                Ok(rpc) => self.discord = Some(rpc),
+                Err(error) => {
+                    self.state.rpc_status = format!("Discord недоступен: {error}");
+                    return;
+                }
             }
         }
         let artist = track.artist().chars().take(100).collect::<String>();
@@ -737,7 +747,11 @@ impl Player {
             .unwrap_or_default()
             .as_secs() as i64;
         let mut activity = activity::Activity::new()
-            .activity_type(activity::ActivityType::Listening)
+            .activity_type(if state.rpc_settings.activity_type == "playing" {
+                activity::ActivityType::Playing
+            } else {
+                activity::ActivityType::Listening
+            })
             .details(&title)
             .state(if artist.is_empty() {
                 "Яндекс Музыка"
@@ -793,10 +807,15 @@ impl Player {
         if state.rpc_settings.language == "en" && state.rpc_settings.links {
             payload["buttons"] = json!([{"label":"Open in app","url":app_link},{"label":"Open on website","url":link}]);
         }
-        if let Some(rpc) = &mut self.discord
-            && rpc.send(json!({"cmd":"SET_ACTIVITY","args":{"pid":std::process::id(),"activity":payload},"nonce":format!("{}-{now}", track.id)}), 1).is_err()
-        {
-            self.discord = None;
+        if let Some(rpc) = &mut self.discord {
+            let nonce = format!("{}-{now}-{}", track.id, state.position);
+            match crate::rpc::publish(rpc, payload, &nonce) {
+                Ok(()) => self.state.rpc_status = "Discord принял активность".into(),
+                Err(error) => {
+                    self.state.rpc_status = format!("Ошибка Discord RPC: {error}");
+                    self.discord = None;
+                }
+            }
         }
     }
 

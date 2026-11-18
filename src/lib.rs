@@ -9,6 +9,7 @@ mod media;
 mod media_session;
 mod player;
 mod preferences;
+mod rpc;
 #[cfg(windows)]
 mod software_window;
 pub mod stream;
