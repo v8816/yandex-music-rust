@@ -710,7 +710,7 @@ impl App {
                 ui.label("Тип активности");
                 egui::ComboBox::from_id_salt("rpc-activity-type")
                     .selected_text(if settings.activity_type == "playing" {
-                        "Играет · режим совместимости"
+                        "Играет · стандартный RPC"
                     } else {
                         "Слушает"
                     })
@@ -723,9 +723,12 @@ impl App {
                         ui.selectable_value(
                             &mut settings.activity_type,
                             "playing".into(),
-                            "Играет · режим совместимости",
+                            "Играет · стандартный RPC",
                         );
                     });
+                if settings.activity_type == "playing" {
+                    ui.small("Заголовок активности задаётся приложением Discord. Исполнитель и трек показаны ниже.");
+                }
                 ui.label("Название статуса");
                 egui::ComboBox::from_id_salt("rpc-title")
                     .selected_text(match settings.title.as_str() {

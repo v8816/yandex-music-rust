@@ -7,6 +7,59 @@ pub use discord_rich_presence::DiscordIpcClient as Client;
 #[cfg(windows)]
 pub use windows_client::Client;
 
+#[cfg(any(windows, test))]
+const MAX_PAYLOAD: usize = 1024 * 1024;
+
+pub fn prepare_activity(mut activity: Value, activity_type: &str) -> Value {
+    if activity_type == "playing"
+        && let Some(fields) = activity.as_object_mut()
+    {
+        for field in ["name", "type", "status_display_type"] {
+            fields.remove(field);
+        }
+    }
+    activity
+}
+
+#[cfg(any(windows, test))]
+fn encode_frame(opcode: u32, payload: &[u8]) -> Result<Vec<u8>> {
+    ensure!(
+        payload.len() <= MAX_PAYLOAD,
+        "Пакет Discord слишком большой"
+    );
+    let mut frame = Vec::with_capacity(8 + payload.len());
+    frame.extend_from_slice(&opcode.to_le_bytes());
+    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    frame.extend_from_slice(payload);
+    Ok(frame)
+}
+
+#[cfg(windows)]
+fn receive(client: &mut impl DiscordIpc) -> Result<(u32, Value)> {
+    for _ in 0..8 {
+        let mut header = [0; 8];
+        client
+            .read(&mut header)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let opcode = u32::from_le_bytes(header[..4].try_into()?);
+        let length = u32::from_le_bytes(header[4..].try_into()?) as usize;
+        ensure!(length <= MAX_PAYLOAD, "Пакет Discord слишком большой");
+        let mut payload = vec![0; length];
+        client
+            .read(&mut payload)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        if opcode == 3 {
+            let pong = encode_frame(4, &payload)?;
+            client
+                .write(&pong)
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            continue;
+        }
+        return Ok((opcode, serde_json::from_slice(&payload)?));
+    }
+    bail!("Discord не прислал ответ после ping")
+}
+
 pub fn publish(client: &mut impl DiscordIpc, activity: Value, nonce: &str) -> Result<()> {
     client
         .send(
@@ -113,6 +166,15 @@ mod windows_client {
             Ok(())
         }
 
+        fn send(&mut self, data: serde_json::Value, opcode: u8) -> IpcResult<()> {
+            let frame = super::encode_frame(opcode as u32, &serde_json::to_vec(&data)?)?;
+            self.write(&frame)
+        }
+
+        fn recv(&mut self) -> IpcResult<(u32, serde_json::Value)> {
+            super::receive(self).map_err(|error| error.into())
+        }
+
         fn write(&mut self, data: &[u8]) -> IpcResult<()> {
             self.socket()?.write_all(data)?;
             Ok(())
@@ -171,13 +233,99 @@ mod tests {
         for kind in [2, 0] {
             let result = publish(
                 &mut client,
-                json!({"type": kind, "details": "Проверка RPC", "state": "Диагностика плеера"}),
+                prepare_activity(
+                    json!({"type": kind, "details": "Проверка RPC", "state": "Диагностика плеера"}),
+                    if kind == 0 { "playing" } else { "listening" },
+                ),
                 &format!("diagnostic-{kind}"),
             );
             let _ = client.clear_activity();
             result.unwrap();
         }
         let _ = client.close();
+    }
+
+    #[test]
+    fn standard_activity_uses_application_defaults_and_preserves_song_data() {
+        let original = json!({
+            "type": 0, "name": "Custom name", "status_display_type": 0,
+            "details": "Song", "state": "Artist",
+            "assets": {"large_image": "https://example.com/cover.png"},
+            "timestamps": {"start": 10, "end": 100},
+            "buttons": [{"label": "Track", "url": "https://example.com/track"}]
+        });
+        let activity = prepare_activity(original.clone(), "playing");
+        for field in ["type", "name", "status_display_type"] {
+            assert!(activity.get(field).is_none());
+        }
+        for field in ["details", "state", "assets", "timestamps", "buttons"] {
+            assert_eq!(activity[field], original[field]);
+        }
+        assert_eq!(prepare_activity(original.clone(), "listening"), original);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn binary_ping_is_echoed_and_oversized_incoming_frames_are_rejected() {
+        struct Pipe {
+            id: String,
+            incoming: std::io::Cursor<Vec<u8>>,
+            outgoing: Vec<u8>,
+        }
+        type IpcResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+        impl DiscordIpc for Pipe {
+            fn get_client_id(&self) -> &String {
+                &self.id
+            }
+            fn connect_ipc(&mut self) -> IpcResult<()> {
+                Ok(())
+            }
+            fn close(&mut self) -> IpcResult<()> {
+                Ok(())
+            }
+            fn read(&mut self, buffer: &mut [u8]) -> IpcResult<()> {
+                use std::io::Read;
+                self.incoming.read_exact(buffer)?;
+                Ok(())
+            }
+            fn write(&mut self, bytes: &[u8]) -> IpcResult<()> {
+                self.outgoing.extend_from_slice(bytes);
+                Ok(())
+            }
+        }
+        let ping = [0xff, 0x00, 0x20];
+        let reply = json!({"cmd": "SET_ACTIVITY", "nonce": "test", "data": {"type": 0}});
+        let mut incoming = encode_frame(3, &ping).unwrap();
+        incoming.extend(encode_frame(1, &serde_json::to_vec(&reply).unwrap()).unwrap());
+        let mut pipe = Pipe {
+            id: "test".into(),
+            incoming: std::io::Cursor::new(incoming),
+            outgoing: vec![],
+        };
+        assert_eq!(receive(&mut pipe).unwrap(), (1, reply));
+        assert_eq!(pipe.outgoing, encode_frame(4, &ping).unwrap());
+
+        let mut oversized = 1u32.to_le_bytes().to_vec();
+        oversized.extend_from_slice(&((MAX_PAYLOAD + 1) as u32).to_le_bytes());
+        pipe.incoming = std::io::Cursor::new(oversized);
+        assert!(
+            receive(&mut pipe)
+                .unwrap_err()
+                .to_string()
+                .contains("слишком большой")
+        );
+    }
+
+    #[test]
+    fn frames_have_a_little_endian_header_and_enforce_payload_limit() {
+        let frame = encode_frame(1, br#"{"cmd":"SET_ACTIVITY"}"#).unwrap();
+        assert_eq!(&frame[..4], &1u32.to_le_bytes());
+        assert_eq!(
+            u32::from_le_bytes(frame[4..8].try_into().unwrap()) as usize,
+            frame.len() - 8
+        );
+        assert_eq!(&frame[8..], br#"{"cmd":"SET_ACTIVITY"}"#);
+        assert!(encode_frame(1, &vec![0; MAX_PAYLOAD + 1]).is_err());
     }
 
     #[test]

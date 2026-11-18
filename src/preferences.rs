@@ -13,7 +13,7 @@ impl Default for RpcSettings {
             title: "artist_track".into(),
             language: "ru".into(),
             links: true,
-            activity_type: "listening".into(),
+            activity_type: "playing".into(),
         }
     }
 }
@@ -92,12 +92,12 @@ mod tests {
         assert!(settings.validate().is_err());
     }
     #[test]
-    fn old_rpc_settings_keep_listening_and_invalid_types_are_rejected() {
+    fn old_rpc_settings_use_standard_activity_and_invalid_types_are_rejected() {
         let mut settings: RpcSettings = serde_json::from_value(serde_json::json!({
             "title": "track", "language": "ru", "links": true
         }))
         .unwrap();
-        assert_eq!(settings.activity_type, "listening");
+        assert_eq!(settings.activity_type, "playing");
         settings.activity_type = "playing".into();
         assert!(settings.validate().is_ok());
         settings.activity_type = "unknown".into();

@@ -157,6 +157,7 @@ struct Player {
     sink: Option<Sink>,
     discord: Option<DiscordIpcClient>,
     last_rpc_attempt: Option<Instant>,
+    last_rpc_update: Option<Instant>,
     wave: Option<Wave>,
     wave_history: Option<WaveHistory>,
     resume_position: Option<f64>,
@@ -238,6 +239,7 @@ impl Player {
             sink: None,
             discord: None,
             last_rpc_attempt: None,
+            last_rpc_update: None,
             wave: None,
             wave_history: None,
             resume_position: None,
@@ -678,8 +680,16 @@ impl Player {
             }
             changed = true;
         }
-        if self.state.rpc && self.sink.is_some() && self.discord.is_none() {
+        if self.state.rpc
+            && self.sink.is_some()
+            && (self.discord.is_none()
+                || self
+                    .last_rpc_update
+                    .is_none_or(|sent| sent.elapsed() >= Duration::from_secs(30)))
+        {
+            let previous_status = self.state.rpc_status.clone();
             self.update_rpc();
+            changed |= previous_status != self.state.rpc_status;
         }
         changed
     }
@@ -701,6 +711,7 @@ impl Player {
         if state.loading {
             return;
         }
+        self.last_rpc_update = Some(Instant::now());
         let Some(track) = state
             .track
             .filter(|_| self.sink.as_ref().is_some_and(|sink| !sink.empty()))
@@ -809,6 +820,7 @@ impl Player {
         }
         if let Some(rpc) = &mut self.discord {
             let nonce = format!("{}-{now}-{}", track.id, state.position);
+            let payload = crate::rpc::prepare_activity(payload, &state.rpc_settings.activity_type);
             match crate::rpc::publish(rpc, payload, &nonce) {
                 Ok(()) => self.state.rpc_status = "Discord принял активность".into(),
                 Err(error) => {
