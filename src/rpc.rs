@@ -1,3 +1,4 @@
+use crate::{api::Track, preferences::RpcSettings};
 use anyhow::{Result, bail, ensure};
 use discord_rich_presence::DiscordIpc;
 use serde_json::{Value, json};
@@ -19,22 +20,82 @@ pub fn application_id(language: &str) -> &'static str {
     }
 }
 
-pub fn discord_text(value: &str, fallback: &str) -> String {
+fn discord_text(value: &str, fallback: &str) -> String {
     let value = value.trim();
-    let mut text: String = if value.is_empty() { fallback } else { value }
-        .chars()
-        .take(128)
-        .collect();
+    let value = if value.is_empty() { fallback } else { value };
+    let mut text = value[..value.floor_char_boundary(128)].to_owned();
     if text.chars().count() == 1 {
         text.push('\u{200b}');
     }
     text
 }
 
-pub fn prepare_activity(mut activity: Value, activity_type: &str) -> Value {
-    activity["type"] = json!(if activity_type == "playing" { 0 } else { 2 });
-    activity["status_display_type"] = json!(0);
-    activity["instance"] = json!(true);
+pub fn music_activity(
+    track: &Track,
+    settings: &RpcSettings,
+    playing: bool,
+    position: f64,
+    duration: f64,
+    now: i64,
+) -> Value {
+    const ASSETS: &str =
+        "https://raw.githubusercontent.com/v8816/yandex-music-rust/dev/desktop-polish/assets";
+    let english = settings.language == "en";
+    let title = discord_text(&track.title, "Музыка");
+    let artist = discord_text(&track.artist(), "Яндекс Музыка");
+    let name = discord_text(&settings.display_name(&artist, &title), "Яндекс Музыка");
+    let cover = track.cover().map_or_else(
+        || format!("{ASSETS}/app.png"),
+        |uri| {
+            let path = uri
+                .trim_start_matches("https://")
+                .trim_start_matches("http://");
+            format!("https://{}", path.replace("%%", "400x400"))
+        },
+    );
+    let icon = if playing {
+        "rpc-playing.png"
+    } else {
+        "rpc-paused.png"
+    };
+    let status = match (playing, english) {
+        (true, true) => "Playing",
+        (false, true) => "Paused",
+        (true, false) => "Проигрывается",
+        (false, false) => "Пауза",
+    };
+    let mut activity = json!({
+        "type": if settings.activity_type == "playing" { 0 } else { 2 },
+        "status_display_type": 0,
+        "instance": true,
+        "name": name,
+        "details": title,
+        "state": artist,
+        "assets": {
+            "large_image": cover,
+            "large_text": title,
+            "small_image": format!("{ASSETS}/{icon}"),
+            "small_text": status
+        }
+    });
+    if playing && duration > position {
+        activity["timestamps"] = json!({
+            "start": now - position as i64,
+            "end": now + (duration - position) as i64
+        });
+    }
+    if settings.links {
+        // Discord counts a button label in UTF-8 bytes, including for Cyrillic.
+        let (app_label, site_label) = if english {
+            ("Open in app", "Open on website")
+        } else {
+            ("В приложении", "На сайте")
+        };
+        activity["buttons"] = json!([
+            {"label": app_label, "url": format!("yandexmusic://track/{}", track.id)},
+            {"label": site_label, "url": track.url()}
+        ]);
+    }
     activity
 }
 
@@ -242,19 +303,38 @@ mod windows_client {
 mod tests {
     use super::*;
 
+    fn sample_track() -> Track {
+        serde_json::from_value(json!({
+            "id": 123, "title": "Ночной поезд 🎧", "artists": [{"name": "Тестовый артист"}],
+            "albums": [{"id": 7}], "durationMs": 90000,
+            "coverUri": "avatars.yandex.net/get-music-content/example/%%"
+        }))
+        .unwrap()
+    }
+
     #[test]
     #[ignore = "publishes and clears a diagnostic activity in the local Discord client"]
     fn live_discord_accepts_listening_and_playing() {
+        let mut track = sample_track();
+        // Use the same fallback artwork as real tracks without a cover.
+        track.cover_uri = None;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
         for language in ["ru", "en"] {
             let mut client = Client::new(application_id(language)).unwrap();
             client.connect().unwrap();
             for mode in ["listening", "playing"] {
+                let settings = RpcSettings {
+                    language: language.into(),
+                    activity_type: mode.into(),
+                    ..Default::default()
+                };
+                let activity = music_activity(&track, &settings, true, 12.0, 90.0, now);
                 let result = publish(
                     &mut client,
-                    prepare_activity(
-                        json!({"name": "Яндекс Музыка", "details": "Проверка RPC", "state": "Диагностика плеера"}),
-                        mode,
-                    ),
+                    activity,
                     &format!("diagnostic-{language}-{mode}"),
                 );
                 let _ = client.clear_activity();
@@ -265,37 +345,81 @@ mod tests {
     }
 
     #[test]
-    fn music_application_and_activity_format_match_the_selected_settings() {
+    fn localized_music_activity_respects_discord_limits_and_player_settings() {
         assert_ne!(application_id("ru"), application_id("en"));
-        for (mode, kind) in [("playing", 0), ("listening", 2)] {
-            let activity = prepare_activity(
-                json!({
-                    "name": "Artist — Song", "details": "Song", "state": "Artist",
-                    "assets": {"large_image": "https://example.com/cover.png"},
-                    "timestamps": {"start": 10, "end": 100},
-                    "buttons": [{"label": "Track", "url": "https://example.com/track"}]
-                }),
-                mode,
-            );
-            assert_eq!(activity["type"], kind);
-            assert_eq!(activity["name"], "Artist — Song");
-            assert_eq!(activity["details"], "Song");
-            assert_eq!(activity["state"], "Artist");
-            assert_eq!(activity["instance"], true);
-            assert_eq!(activity["status_display_type"], 0);
-            assert!(activity["assets"].is_object());
-            assert!(activity["timestamps"].is_object());
-            assert!(activity["buttons"].is_array());
+        let track = sample_track();
+        for language in ["ru", "en"] {
+            for (mode, kind) in [("playing", 0), ("listening", 2)] {
+                for links in [true, false] {
+                    let settings = RpcSettings {
+                        language: language.into(),
+                        activity_type: mode.into(),
+                        links,
+                        ..Default::default()
+                    };
+                    for playing in [true, false] {
+                        let activity = music_activity(&track, &settings, playing, 12.0, 90.0, 1000);
+                        assert_eq!(activity["type"], kind);
+                        assert_eq!(activity["status_display_type"], 0);
+                        assert_eq!(activity["instance"], true);
+                        assert_eq!(activity["name"], "Тестовый артист — Ночной поезд 🎧");
+                        assert_eq!(activity["details"], track.title);
+                        assert_eq!(activity["state"], track.artist());
+                        assert_eq!(
+                            activity["assets"]["large_image"],
+                            "https://avatars.yandex.net/get-music-content/example/400x400"
+                        );
+                        assert_eq!(activity["assets"]["large_text"], track.title);
+                        let icon = if playing {
+                            "rpc-playing.png"
+                        } else {
+                            "rpc-paused.png"
+                        };
+                        assert!(
+                            activity["assets"]["small_image"]
+                                .as_str()
+                                .unwrap()
+                                .ends_with(icon)
+                        );
+                        let status = match (language, playing) {
+                            ("en", true) => "Playing",
+                            ("en", false) => "Paused",
+                            (_, true) => "Проигрывается",
+                            (_, false) => "Пауза",
+                        };
+                        assert_eq!(activity["assets"]["small_text"], status);
+                        if playing {
+                            assert_eq!(activity["timestamps"], json!({"start":988, "end":1078}));
+                        } else {
+                            assert!(activity.get("timestamps").is_none());
+                        }
+                        if links {
+                            let buttons = activity["buttons"].as_array().unwrap();
+                            assert_eq!(buttons.len(), 2);
+                            for button in buttons {
+                                let bytes = button["label"].as_str().unwrap().len();
+                                assert!((1..=32).contains(&bytes), "{language}: {button}");
+                            }
+                            assert_eq!(buttons[0]["url"], "yandexmusic://track/123");
+                            assert_eq!(buttons[1]["url"], track.url());
+                        } else {
+                            assert!(activity.get("buttons").is_none());
+                        }
+                    }
+                }
+            }
         }
     }
 
     #[test]
-    fn short_and_empty_metadata_still_meet_discord_text_requirements() {
+    fn text_limits_preserve_utf8_characters() {
         assert_eq!(discord_text(" Я ", "Музыка"), "Я\u{200b}");
         assert_eq!(discord_text(" ", "Музыка"), "Музыка");
+        assert_eq!(discord_text(&"я".repeat(140), "Музыка"), "я".repeat(64));
+        let almost_full = "a".repeat(127);
         assert_eq!(
-            discord_text(&"я".repeat(140), "Музыка").chars().count(),
-            128
+            discord_text(&format!("{almost_full}🎧"), "Музыка"),
+            almost_full
         );
     }
 

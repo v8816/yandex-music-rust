@@ -4,7 +4,7 @@ use crate::preferences::WaveStation;
 use crate::rpc::Client as DiscordIpcClient;
 use crate::worker::{Loaded, Loader};
 use anyhow::{Context, Result, bail, ensure};
-use discord_rich_presence::{DiscordIpc, activity};
+use discord_rich_presence::DiscordIpc;
 use rodio::{Decoder, OutputStream, OutputStreamBuilder, Sink, Source};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -681,7 +681,7 @@ impl Player {
             changed = true;
         }
         if self.state.rpc
-            && self.sink.is_some()
+            && self.sink.as_ref().is_some_and(|sink| !sink.empty())
             && (self.discord.is_none()
                 || self
                     .last_rpc_update
@@ -716,11 +716,8 @@ impl Player {
             .track
             .filter(|_| self.sink.as_ref().is_some_and(|sink| !sink.empty()))
         else {
-            if let Some(rpc) = &mut self.discord
-                && rpc.clear_activity().is_err()
-            {
-                self.discord = None;
-            }
+            self.clear_rpc();
+            self.last_rpc_attempt = None;
             return;
         };
         let application_id = crate::rpc::application_id(&state.rpc_settings.language);
@@ -752,82 +749,24 @@ impl Player {
                 }
             }
         }
-        let artist = crate::rpc::discord_text(&track.artist(), "Яндекс Музыка");
-        let title = crate::rpc::discord_text(&track.title, "Музыка");
-        let link = track.url();
-        let app_link = format!("yandexmusic://track/{}", track.id);
-        let cover = track.cover().map(|uri| {
-            format!(
-                "https://{}",
-                uri.trim_start_matches("https://").replace("%%", "400x400")
-            )
-        });
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-        let mut activity = activity::Activity::new()
-            .activity_type(if state.rpc_settings.activity_type == "playing" {
-                activity::ActivityType::Playing
-            } else {
-                activity::ActivityType::Listening
-            })
-            .details(&title)
-            .state(if artist.is_empty() {
-                "Яндекс Музыка"
-            } else {
-                &artist
-            })
-            .buttons(vec![
-                activity::Button::new("Открыть в приложении", &app_link),
-                activity::Button::new("Открыть на сайте", &link),
-            ]);
-        const ASSETS: &str =
-            "https://raw.githubusercontent.com/v8816/yandex-music-rust/dev/desktop-polish/assets";
-        let icon = if state.playing {
-            "rpc-playing.png"
-        } else {
-            "rpc-paused.png"
-        };
-        let small_image = format!("{ASSETS}/{icon}");
-        let fallback_cover = format!("{ASSETS}/app.png");
-        let status = match (state.playing, state.rpc_settings.language == "en") {
-            (true, true) => "Playing",
-            (false, true) => "Paused",
-            (true, false) => "Проигрывается",
-            (false, false) => "Пауза",
-        };
-        activity = activity.assets(
-            activity::Assets::new()
-                .large_image(cover.as_deref().unwrap_or(&fallback_cover))
-                .large_text(&title)
-                .small_image(&small_image)
-                .small_text(status),
-        );
-        if state.playing && state.duration > state.position {
-            activity = activity.timestamps(
-                activity::Timestamps::new()
-                    .start(now - state.position as i64)
-                    .end(now + (state.duration - state.position) as i64),
-            );
-        }
-        let mut payload = serde_json::to_value(activity).unwrap_or_default();
-        payload["name"] = json!(crate::rpc::discord_text(
-            &state.rpc_settings.display_name(&artist, &title),
-            "Яндекс Музыка"
-        ));
-        payload["status_display_type"] = json!(0);
-        if !state.rpc_settings.links {
-            payload.as_object_mut().unwrap().remove("buttons");
-        }
-        if state.rpc_settings.language == "en" && state.rpc_settings.links {
-            payload["buttons"] = json!([{"label":"Open in app","url":app_link},{"label":"Open on website","url":link}]);
-        }
         if let Some(rpc) = &mut self.discord {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
             let nonce = format!("{}-{now}-{}", track.id, state.position);
-            let payload = crate::rpc::prepare_activity(payload, &state.rpc_settings.activity_type);
+            let payload = crate::rpc::music_activity(
+                &track,
+                &state.rpc_settings,
+                state.playing,
+                state.position,
+                state.duration,
+                now,
+            );
             match crate::rpc::publish(rpc, payload, &nonce) {
-                Ok(()) => self.state.rpc_status = "Discord принял активность".into(),
+                Ok(()) => {
+                    self.state.rpc_status = "Локальный клиент Discord принял активность".into()
+                }
                 Err(error) => {
                     self.state.rpc_status = format!("Ошибка Discord RPC: {error}");
                     self.discord = None;
