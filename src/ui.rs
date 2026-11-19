@@ -704,6 +704,28 @@ impl App {
                 }
                 let mut settings = s.rpc_settings.clone();
                 let before = serde_json::to_value(&settings).unwrap_or_default();
+                if s.rpc && !s.rpc_status.is_empty() {
+                    ui.small(&s.rpc_status);
+                }
+                ui.label("Тип активности");
+                egui::ComboBox::from_id_salt("rpc-activity-type")
+                    .selected_text(if settings.activity_type == "playing" {
+                        "Играет в"
+                    } else {
+                        "Слушает"
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut settings.activity_type,
+                            "listening".into(),
+                            "Слушает",
+                        );
+                        ui.selectable_value(
+                            &mut settings.activity_type,
+                            "playing".into(),
+                            "Играет в",
+                        );
+                    });
                 ui.label("Название статуса");
                 egui::ComboBox::from_id_salt("rpc-title")
                     .selected_text(match settings.title.as_str() {

@@ -5,6 +5,7 @@ pub struct RpcSettings {
     pub title: String,
     pub language: String,
     pub links: bool,
+    pub activity_type: String,
 }
 impl Default for RpcSettings {
     fn default() -> Self {
@@ -12,6 +13,7 @@ impl Default for RpcSettings {
             title: "artist_track".into(),
             language: "ru".into(),
             links: true,
+            activity_type: "playing".into(),
         }
     }
 }
@@ -33,7 +35,8 @@ impl RpcSettings {
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             ["app", "artist", "artist_track", "track"].contains(&self.title.as_str())
-                && ["ru", "en"].contains(&self.language.as_str()),
+                && ["ru", "en"].contains(&self.language.as_str())
+                && ["listening", "playing"].contains(&self.activity_type.as_str()),
             "Некорректные настройки RPC"
         );
         Ok(())
@@ -89,16 +92,31 @@ mod tests {
         assert!(settings.validate().is_err());
     }
     #[test]
+    fn old_rpc_settings_use_standard_activity_and_invalid_types_are_rejected() {
+        let mut settings: RpcSettings = serde_json::from_value(serde_json::json!({
+            "title": "track", "language": "ru", "links": true
+        }))
+        .unwrap();
+        assert_eq!(settings.activity_type, "playing");
+        settings.activity_type = "playing".into();
+        assert!(settings.validate().is_ok());
+        settings.activity_type = "unknown".into();
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
     fn settings_round_trip_preserves_language_and_link_choice() {
         let settings = RpcSettings {
             title: "track".into(),
             language: "en".into(),
             links: false,
+            activity_type: "playing".into(),
         };
         let decoded: RpcSettings =
             serde_json::from_slice(&serde_json::to_vec(&settings).unwrap()).unwrap();
         assert_eq!(decoded.title, "track");
         assert_eq!(decoded.language, "en");
         assert!(!decoded.links);
+        assert_eq!(decoded.activity_type, "playing");
     }
 }
