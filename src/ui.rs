@@ -710,7 +710,7 @@ impl App {
                 ui.label("Тип активности");
                 egui::ComboBox::from_id_salt("rpc-activity-type")
                     .selected_text(if settings.activity_type == "playing" {
-                        "Играет · стандартный RPC"
+                        "Играет в"
                     } else {
                         "Слушает"
                     })
@@ -723,7 +723,7 @@ impl App {
                         ui.selectable_value(
                             &mut settings.activity_type,
                             "playing".into(),
-                            "Играет · стандартный RPC",
+                            "Играет в",
                         );
                     });
                 if settings.activity_type == "playing" {
