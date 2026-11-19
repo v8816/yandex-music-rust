@@ -726,9 +726,6 @@ impl App {
                             "Играет в",
                         );
                     });
-                if settings.activity_type == "playing" {
-                    ui.small("Заголовок активности задаётся приложением Discord. Исполнитель и трек показаны ниже.");
-                }
                 ui.label("Название статуса");
                 egui::ComboBox::from_id_salt("rpc-title")
                     .selected_text(match settings.title.as_str() {

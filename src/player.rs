@@ -723,15 +723,24 @@ impl Player {
             }
             return;
         };
+        let application_id = crate::rpc::application_id(&state.rpc_settings.language);
+        if self
+            .discord
+            .as_ref()
+            .is_some_and(|client| client.get_client_id() != application_id)
+        {
+            self.clear_rpc();
+            self.last_rpc_attempt = None;
+        }
         if self.discord.is_none() {
             if self
                 .last_rpc_attempt
-                .is_some_and(|t| t.elapsed() < Duration::from_secs(12))
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(5))
             {
                 return;
             }
             self.last_rpc_attempt = Some(Instant::now());
-            let result = DiscordIpcClient::new("1124055337234858005").and_then(|mut rpc| {
+            let result = DiscordIpcClient::new(application_id).and_then(|mut rpc| {
                 rpc.connect()?;
                 Ok(rpc)
             });
@@ -743,8 +752,8 @@ impl Player {
                 }
             }
         }
-        let artist = track.artist().chars().take(100).collect::<String>();
-        let title = track.title.chars().take(100).collect::<String>();
+        let artist = crate::rpc::discord_text(&track.artist(), "Яндекс Музыка");
+        let title = crate::rpc::discord_text(&track.title, "Музыка");
         let link = track.url();
         let app_link = format!("yandexmusic://track/{}", track.id);
         let cover = track.cover().map(|uri| {
@@ -803,14 +812,10 @@ impl Player {
             );
         }
         let mut payload = serde_json::to_value(activity).unwrap_or_default();
-        payload["name"] = json!(
-            state
-                .rpc_settings
-                .display_name(&artist, &title)
-                .chars()
-                .take(128)
-                .collect::<String>()
-        );
+        payload["name"] = json!(crate::rpc::discord_text(
+            &state.rpc_settings.display_name(&artist, &title),
+            "Яндекс Музыка"
+        ));
         payload["status_display_type"] = json!(0);
         if !state.rpc_settings.links {
             payload.as_object_mut().unwrap().remove("buttons");

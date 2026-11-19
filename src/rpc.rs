@@ -10,14 +10,31 @@ pub use windows_client::Client;
 #[cfg(any(windows, test))]
 const MAX_PAYLOAD: usize = 1024 * 1024;
 
-pub fn prepare_activity(mut activity: Value, activity_type: &str) -> Value {
-    if activity_type == "playing"
-        && let Some(fields) = activity.as_object_mut()
-    {
-        for field in ["name", "type", "status_display_type"] {
-            fields.remove(field);
-        }
+// Shared music application IDs used by FozerG/WinYandexMusicRPC.
+pub fn application_id(language: &str) -> &'static str {
+    if language == "en" {
+        "1269807014393942046"
+    } else {
+        "1269826362399522849"
     }
+}
+
+pub fn discord_text(value: &str, fallback: &str) -> String {
+    let value = value.trim();
+    let mut text: String = if value.is_empty() { fallback } else { value }
+        .chars()
+        .take(128)
+        .collect();
+    if text.chars().count() == 1 {
+        text.push('\u{200b}');
+    }
+    text
+}
+
+pub fn prepare_activity(mut activity: Value, activity_type: &str) -> Value {
+    activity["type"] = json!(if activity_type == "playing" { 0 } else { 2 });
+    activity["status_display_type"] = json!(0);
+    activity["instance"] = json!(true);
     activity
 }
 
@@ -228,40 +245,58 @@ mod tests {
     #[test]
     #[ignore = "publishes and clears a diagnostic activity in the local Discord client"]
     fn live_discord_accepts_listening_and_playing() {
-        let mut client = Client::new("1124055337234858005").unwrap();
-        client.connect().unwrap();
-        for kind in [2, 0] {
-            let result = publish(
-                &mut client,
-                prepare_activity(
-                    json!({"type": kind, "details": "Проверка RPC", "state": "Диагностика плеера"}),
-                    if kind == 0 { "playing" } else { "listening" },
-                ),
-                &format!("diagnostic-{kind}"),
-            );
-            let _ = client.clear_activity();
-            result.unwrap();
+        for language in ["ru", "en"] {
+            let mut client = Client::new(application_id(language)).unwrap();
+            client.connect().unwrap();
+            for mode in ["listening", "playing"] {
+                let result = publish(
+                    &mut client,
+                    prepare_activity(
+                        json!({"name": "Яндекс Музыка", "details": "Проверка RPC", "state": "Диагностика плеера"}),
+                        mode,
+                    ),
+                    &format!("diagnostic-{language}-{mode}"),
+                );
+                let _ = client.clear_activity();
+                result.unwrap();
+            }
+            let _ = client.close();
         }
-        let _ = client.close();
     }
 
     #[test]
-    fn standard_activity_uses_application_defaults_and_preserves_song_data() {
-        let original = json!({
-            "type": 0, "name": "Custom name", "status_display_type": 0,
-            "details": "Song", "state": "Artist",
-            "assets": {"large_image": "https://example.com/cover.png"},
-            "timestamps": {"start": 10, "end": 100},
-            "buttons": [{"label": "Track", "url": "https://example.com/track"}]
-        });
-        let activity = prepare_activity(original.clone(), "playing");
-        for field in ["type", "name", "status_display_type"] {
-            assert!(activity.get(field).is_none());
+    fn music_application_and_activity_format_match_the_selected_settings() {
+        assert_ne!(application_id("ru"), application_id("en"));
+        for (mode, kind) in [("playing", 0), ("listening", 2)] {
+            let activity = prepare_activity(
+                json!({
+                    "name": "Artist — Song", "details": "Song", "state": "Artist",
+                    "assets": {"large_image": "https://example.com/cover.png"},
+                    "timestamps": {"start": 10, "end": 100},
+                    "buttons": [{"label": "Track", "url": "https://example.com/track"}]
+                }),
+                mode,
+            );
+            assert_eq!(activity["type"], kind);
+            assert_eq!(activity["name"], "Artist — Song");
+            assert_eq!(activity["details"], "Song");
+            assert_eq!(activity["state"], "Artist");
+            assert_eq!(activity["instance"], true);
+            assert_eq!(activity["status_display_type"], 0);
+            assert!(activity["assets"].is_object());
+            assert!(activity["timestamps"].is_object());
+            assert!(activity["buttons"].is_array());
         }
-        for field in ["details", "state", "assets", "timestamps", "buttons"] {
-            assert_eq!(activity[field], original[field]);
-        }
-        assert_eq!(prepare_activity(original.clone(), "listening"), original);
+    }
+
+    #[test]
+    fn short_and_empty_metadata_still_meet_discord_text_requirements() {
+        assert_eq!(discord_text(" Я ", "Музыка"), "Я\u{200b}");
+        assert_eq!(discord_text(" ", "Музыка"), "Музыка");
+        assert_eq!(
+            discord_text(&"я".repeat(140), "Музыка").chars().count(),
+            128
+        );
     }
 
     #[cfg(windows)]

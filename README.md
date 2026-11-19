@@ -40,3 +40,5 @@ cargo build --locked --release
 Неофициальный API может меняться. Кнопка RPC «Открыть в приложении» использует протокол `yandexmusic://` и требует зарегистрированного обработчика. Отображение RPC и кнопок проверяйте с другого аккаунта Discord.
 
 Проект не связан с Яндексом. Лицензия исходного проекта — `LICENSE-UPSTREAM`.
+
+Подключение RPC использует публичные приложения Discord из [WinYandexMusicRPC](https://github.com/FozerG/WinYandexMusicRPC).
