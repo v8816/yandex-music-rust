@@ -8,11 +8,12 @@ use std::{
         mpsc::{self, Receiver, SyncSender},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const MAX_COVERS: usize = 40;
 const MAX_BYTES: u64 = 1024 * 1024;
+const UNAVAILABLE_RETRY: Duration = Duration::from_secs(5);
 type LoadedCover = (String, Option<ColorImage>);
 
 pub struct Covers {
@@ -24,7 +25,7 @@ pub struct Covers {
 enum Cover {
     Loading,
     Ready(TextureHandle, Color32),
-    Unavailable,
+    Unavailable { retry_at: Instant },
 }
 
 impl Covers {
@@ -32,7 +33,7 @@ impl Covers {
         let (requests, incoming) = mpsc::sync_channel::<String>(32);
         let incoming = Arc::new(Mutex::new(incoming));
         let (loaded, results) = mpsc::sync_channel(4);
-        let client = crate::api::http_client().ok();
+        let client = cover_client().ok();
         for _ in 0..2 {
             let (incoming, loaded, ctx, client) = (
                 incoming.clone(),
@@ -62,24 +63,29 @@ impl Covers {
     pub fn poll(&mut self, ctx: &Context) {
         for (uri, image) in self.results.try_iter() {
             if let Some((_, cover)) = self.entries.get_mut(&uri) {
-                *cover = image.map_or(Cover::Unavailable, |image| {
-                    let mut rgb = [0u64; 3];
-                    for pixel in &image.pixels {
-                        rgb[0] += pixel.r() as u64;
-                        rgb[1] += pixel.g() as u64;
-                        rgb[2] += pixel.b() as u64;
-                    }
-                    let n = image.pixels.len().max(1) as u64;
-                    let color = Color32::from_rgb(
-                        (rgb[0] / n) as u8,
-                        (rgb[1] / n) as u8,
-                        (rgb[2] / n) as u8,
-                    );
-                    Cover::Ready(
-                        ctx.load_texture("track-cover", image, TextureOptions::LINEAR),
-                        color,
-                    )
-                });
+                *cover = image.map_or(
+                    Cover::Unavailable {
+                        retry_at: Instant::now() + UNAVAILABLE_RETRY,
+                    },
+                    |image| {
+                        let mut rgb = [0u64; 3];
+                        for pixel in &image.pixels {
+                            rgb[0] += pixel.r() as u64;
+                            rgb[1] += pixel.g() as u64;
+                            rgb[2] += pixel.b() as u64;
+                        }
+                        let n = image.pixels.len().max(1) as u64;
+                        let color = Color32::from_rgb(
+                            (rgb[0] / n) as u8,
+                            (rgb[1] / n) as u8,
+                            (rgb[2] / n) as u8,
+                        );
+                        Cover::Ready(
+                            ctx.load_texture("track-cover", image, TextureOptions::LINEAR),
+                            color,
+                        )
+                    },
+                );
             }
         }
     }
@@ -141,13 +147,23 @@ impl Covers {
     }
 
     fn texture(&mut self, ctx: &Context, uri: &str) -> Option<egui::TextureId> {
+        let now = Instant::now();
         let frame = ctx.cumulative_frame_nr();
         if let Some((seen, entry)) = self.entries.get_mut(uri) {
             *seen = frame;
-            return match entry {
-                Cover::Ready(texture, _) => Some(texture.id()),
-                _ => None,
-            };
+            match entry {
+                Cover::Ready(texture, _) => return Some(texture.id()),
+                Cover::Loading => return None,
+                Cover::Unavailable { retry_at } if now < *retry_at => return None,
+                Cover::Unavailable { .. } => {}
+            }
+        }
+        if self
+            .entries
+            .get(uri)
+            .is_some_and(|(_, entry)| matches!(entry, Cover::Unavailable { .. }))
+        {
+            self.entries.remove(uri);
         }
         if uri.contains("400x400") {
             self.entries
@@ -176,21 +192,40 @@ pub(crate) fn cover_url(uri: &str) -> Option<Url> {
         .ok()
         .filter(|url| url.has_host())
         .or_else(|| Url::parse(&format!("https://{}", uri.trim_start_matches('/'))).ok())?;
-    if url.scheme() != "https"
-        || url.port().is_some()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || !url.host_str().is_some_and(|host| {
+    if !cover_host_allowed(&url) {
+        return None;
+    }
+    url.set_fragment(None);
+    Some(url)
+}
+
+fn cover_host_allowed(url: &Url) -> bool {
+    url.scheme() == "https"
+        && url.port().is_none()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.host_str().is_some_and(|host| {
             matches!(
                 host,
                 "avatars.yandex.net" | "avatars.mds.yandex.net" | "avatars.yandex.ru"
             )
         })
-    {
-        return None;
-    }
-    url.set_fragment(None);
-    Some(url)
+}
+
+fn cover_client() -> reqwest::Result<Client> {
+    Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .pool_max_idle_per_host(2)
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 5 {
+                attempt.stop()
+            } else if cover_host_allowed(attempt.url()) {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        }))
+        .build()
 }
 
 fn download(client: &Client, uri: &str) -> Option<ColorImage> {
@@ -222,4 +257,46 @@ fn download(client: &Client, uri: &str) -> Option<ColorImage> {
         [pixels.width() as usize, pixels.height() as usize],
         pixels.as_raw(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cover_urls_normalize_yandex_image_uris_and_reject_external_hosts() {
+        assert_eq!(
+            cover_url("avatars.yandex.net/get-music-content/1/%%")
+                .unwrap()
+                .as_str(),
+            "https://avatars.yandex.net/get-music-content/1/100x100"
+        );
+        assert_eq!(
+            cover_url("https://avatars.mds.yandex.net/get-music-content/1/400x400")
+                .unwrap()
+                .host_str(),
+            Some("avatars.mds.yandex.net")
+        );
+        assert!(cover_url("https://example.com/cover.png").is_none());
+        assert!(cover_url("http://avatars.yandex.net/cover.png").is_none());
+    }
+
+    #[test]
+    fn cover_redirects_stay_on_https_yandex_artwork_hosts() {
+        assert!(cover_host_allowed(
+            &Url::parse("https://avatars.mds.yandex.net/cover.png").unwrap()
+        ));
+        assert!(!cover_host_allowed(
+            &Url::parse("http://avatars.yandex.net/cover.png").unwrap()
+        ));
+        assert!(!cover_host_allowed(
+            &Url::parse("https://example.com/cover.png").unwrap()
+        ));
+        assert!(!cover_host_allowed(
+            &Url::parse("https://avatars.yandex.net.evil.example/cover.png").unwrap()
+        ));
+        assert!(!cover_host_allowed(
+            &Url::parse("https://user@avatars.yandex.net/cover.png").unwrap()
+        ));
+    }
 }
