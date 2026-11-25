@@ -113,7 +113,7 @@ impl Covers {
     }
 
     pub fn draw(&mut self, ui: &mut egui::Ui, uri: Option<&str>, size: f32) -> egui::Response {
-        let (rect, response) =
+        let (rect, mut response) =
             ui.allocate_exact_size(egui::Vec2::splat(size), egui::Sense::click());
         if !ui.is_rect_visible(rect) {
             return response;
@@ -123,10 +123,18 @@ impl Covers {
         } else {
             None
         };
-        let texture = large_uri
-            .as_deref()
-            .or(uri)
-            .and_then(|uri| self.texture(ui.ctx(), uri));
+        let large_failed = large_uri.as_deref().is_some_and(|large_uri| {
+            matches!(
+                self.entries.get(large_uri).map(|(_, cover)| cover),
+                Some(Cover::Unavailable { .. })
+            )
+        });
+        let requested_uri = if large_failed && large_uri.as_deref() != uri {
+            uri
+        } else {
+            large_uri.as_deref().or(uri)
+        };
+        let texture = requested_uri.and_then(|uri| self.texture(ui.ctx(), uri));
         if let Some(id) = texture {
             let image = egui::Image::new((id, rect.size())).corner_radius(8);
             image.paint_at(ui, rect);
@@ -156,16 +164,27 @@ impl Covers {
                 color,
             );
         }
-        if texture.is_none()
-            && let Some(uri) = uri
-        {
-            if let Some((_, Cover::Unavailable { reason, .. })) = self.entries.get(uri) {
-                response.clone().on_hover_text(reason);
+        if texture.is_none() {
+            let reason = requested_uri
+                .and_then(|uri| self.entries.get(uri))
+                .and_then(|(_, cover)| match cover {
+                    Cover::Unavailable { reason, .. } => Some(reason.as_str()),
+                    _ => None,
+                })
+                .or_else(|| {
+                    large_uri
+                        .as_deref()
+                        .and_then(|uri| self.entries.get(uri))
+                        .and_then(|(_, cover)| match cover {
+                            Cover::Unavailable { reason, .. } => Some(reason.as_str()),
+                            _ => None,
+                        })
+                });
+            if let Some(reason) = reason {
+                response = response.on_hover_text(reason);
+            } else if uri.is_none() {
+                response = response.on_hover_text("Яндекс Музыка не передала ссылку на обложку");
             }
-        } else if texture.is_none() && uri.is_none() {
-            response
-                .clone()
-                .on_hover_text("Яндекс Музыка не передала ссылку на обложку");
         }
         response
     }
@@ -262,7 +281,7 @@ fn download(client: &Client, uri: &str) -> Result<ColorImage, String> {
             if error.is_timeout() {
                 "Истекло время ожидания сервера обложек".to_owned()
             } else {
-                "Не удалось получить обложку с сервера Яндекса".to_owned()
+                format!("Не удалось получить обложку с сервера Яндекса: {error}")
             }
         })?;
     if !response.status().is_success() {
@@ -278,7 +297,7 @@ fn download(client: &Client, uri: &str) -> Result<ColorImage, String> {
     response
         .take(MAX_BYTES + 1)
         .read_to_end(&mut bytes)
-        .map_err(|_| "Не удалось прочитать файл обложки".to_owned())?;
+        .map_err(|error| format!("Не удалось прочитать файл обложки: {error}"))?;
     if bytes.len() as u64 > MAX_BYTES {
         return Err("Файл обложки превышает 1 МБ".into());
     }
@@ -292,7 +311,7 @@ fn download(client: &Client, uri: &str) -> Result<ColorImage, String> {
     reader.limits(limits);
     let pixels = reader
         .decode()
-        .map_err(|_| "Не удалось декодировать изображение обложки".to_owned())?
+        .map_err(|error| format!("Не удалось декодировать изображение обложки: {error}"))?
         .into_rgba8();
     Ok(ColorImage::from_rgba_unmultiplied(
         [pixels.width() as usize, pixels.height() as usize],
