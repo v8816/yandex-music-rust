@@ -230,16 +230,50 @@ impl Covers {
 }
 
 pub(crate) fn cover_url(uri: &str) -> Option<Url> {
-    let uri = uri.replace("%%", "100x100");
+    cover_url_result(uri).ok()
+}
+
+fn cover_url_result(uri: &str) -> Result<Url, String> {
+    let uri = uri.trim().replace("%%", "100x100");
+    if uri.is_empty() {
+        return Err("Яндекс Музыка прислала пустой адрес обложки".into());
+    }
     let mut url = Url::parse(&uri)
         .ok()
         .filter(|url| url.has_host())
-        .or_else(|| Url::parse(&format!("https://{}", uri.trim_start_matches('/'))).ok())?;
+        .or_else(|| Url::parse(&format!("https://{}", uri.trim_start_matches('/'))).ok())
+        .ok_or_else(|| "Не удалось разобрать адрес обложки".to_owned())?;
+    if url.scheme() == "http"
+        && yandex_cover_host(&url)
+        && url.port().is_none()
+        && url.username().is_empty()
+        && url.password().is_none()
+    {
+        url.set_scheme("https")
+            .map_err(|_| "Не удалось преобразовать адрес обложки в HTTPS".to_owned())?;
+    }
     if !cover_host_allowed(&url) {
-        return None;
+        let host = url.host_str().unwrap_or("без имени");
+        let reason = if !yandex_cover_host(&url) {
+            format!("Недопустимый сервер обложки: {host}")
+        } else if url.scheme() != "https" {
+            "Сервер обложки не использует HTTPS".to_owned()
+        } else {
+            "Адрес обложки содержит порт или учётные данные".to_owned()
+        };
+        return Err(reason);
     }
     url.set_fragment(None);
-    Some(url)
+    Ok(url)
+}
+
+fn yandex_cover_host(url: &Url) -> bool {
+    url.host_str().is_some_and(|host| {
+        matches!(
+            host,
+            "avatars.yandex.net" | "avatars.mds.yandex.net" | "avatars.yandex.ru"
+        )
+    })
 }
 
 fn cover_host_allowed(url: &Url) -> bool {
@@ -247,12 +281,7 @@ fn cover_host_allowed(url: &Url) -> bool {
         && url.port().is_none()
         && url.username().is_empty()
         && url.password().is_none()
-        && url.host_str().is_some_and(|host| {
-            matches!(
-                host,
-                "avatars.yandex.net" | "avatars.mds.yandex.net" | "avatars.yandex.ru"
-            )
-        })
+        && yandex_cover_host(url)
 }
 
 fn cover_client() -> reqwest::Result<Client> {
@@ -272,7 +301,7 @@ fn cover_client() -> reqwest::Result<Client> {
 }
 
 fn download(client: &Client, uri: &str) -> Result<ColorImage, String> {
-    let url = cover_url(uri).ok_or_else(|| "Некорректный адрес обложки".to_owned())?;
+    let url = cover_url_result(uri)?;
     let response = client
         .get(url)
         .timeout(Duration::from_secs(8))
