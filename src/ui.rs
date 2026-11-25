@@ -440,11 +440,11 @@ impl App {
             self.playlist_tracks.clear();
             self.playlist_error.clear();
         }
+        if page == Page::Search {
+            self.focus_search = true;
+        }
         if self.page != page {
             self.page = page;
-            if page == Page::Search {
-                self.focus_search = true;
-            }
             if page == Page::Library && signed_in {
                 self.send("library", json!({}));
             }
@@ -497,6 +497,9 @@ impl App {
             .find(|&key| input.key_pressed(key));
             (input.modifiers.ctrl, input.modifiers.shift, pressed)
         });
+        if pressed == Some(Key::Space) && ctx.memory(|m| m.focused().is_some()) {
+            return;
+        }
         if let Some((name, args)) = shortcut_command(ctrl, shift, pressed, s) {
             self.send(name, args);
         }
@@ -504,30 +507,31 @@ impl App {
 
     fn nav(&mut self, ctx: &Context, s: &Snapshot) {
         egui::SidePanel::left("nav")
-            .exact_width(190.0)
+            .exact_width(192.0)
             .frame(
                 Frame::new()
                     .fill(Color32::from_rgb(20, 20, 24))
-                    .inner_margin(14),
+                    .inner_margin(16),
             )
             .show(ctx, |ui| {
                 ScrollArea::vertical()
                     .id_salt("navigation")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.label(RichText::new("Яндекс Музыка").size(19.0).strong());
-                        ui.add_space(22.0);
+                        ui.spacing_mut().item_spacing.y = 4.0;
+                        ui.label(RichText::new("Яндекс Музыка").size(20.0).strong());
+                        ui.add_space(16.0);
                         for (page, title) in [(Page::Home, "Главная"), (Page::Search, "Поиск")]
                         {
                             if nav_item(ui, title, Some(page), self.page == page) {
                                 self.navigate(page, s.logged_in);
                             }
                         }
-                        ui.add_space(20.0);
+                        ui.add_space(16.0);
                         ui.label(
-                            RichText::new("МОЯ МУЗЫКА")
-                                .size(10.0)
-                                .color(Color32::from_gray(130)),
+                            RichText::new("Моя музыка")
+                                .size(12.0)
+                                .color(Color32::from_gray(160)),
                         );
                         for (page, title) in [
                             (Page::Library, "Любимое"),
@@ -538,7 +542,7 @@ impl App {
                                 self.navigate(page, s.logged_in);
                             }
                         }
-                        ui.add_space(18.0);
+                        ui.add_space(16.0);
                         ui.separator();
                         if nav_item(
                             ui,
@@ -2404,31 +2408,47 @@ fn playlists_from(value: Value) -> Result<Vec<Playlist>, String> {
 
 fn nav_item(ui: &mut egui::Ui, label: &str, icon: Option<Page>, active: bool) -> bool {
     let color = if active {
-        YELLOW
+        Color32::WHITE
+    } else if icon.is_some() {
+        Color32::from_gray(213)
     } else {
-        Color32::from_gray(221)
+        Color32::from_gray(170)
     };
     let response = ui
         .scope(|ui| {
-            if icon.is_some() {
-                ui.spacing_mut().button_padding.x = 30.0;
-            }
+            ui.spacing_mut().button_padding.x = if icon.is_some() { 36.0 } else { 12.0 };
+            let visuals = ui.visuals_mut();
+            visuals.selection.bg_fill = Color32::from_gray(48);
+            visuals.selection.stroke = egui::Stroke::NONE;
+            visuals.widgets.hovered.weak_bg_fill = Color32::from_gray(42);
             ui.add_sized(
-                [ui.available_width(), 39.0],
-                egui::Button::new(RichText::new(label).size(15.0).color(color))
-                    .selected(active)
-                    .frame_when_inactive(active)
-                    .corner_radius(10)
-                    .right_text("")
-                    .truncate(),
+                [ui.available_width(), 36.0],
+                egui::Button::new(
+                    RichText::new(label)
+                        .size(if icon.is_some() { 15.0 } else { 13.0 })
+                        .color(color),
+                )
+                .selected(active)
+                .frame_when_inactive(active)
+                .corner_radius(8)
+                .right_text("")
+                .truncate(),
             )
         })
         .inner;
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            response.rect.shrink(1.0),
+            8,
+            egui::Stroke::new(1.5_f32, Color32::from_gray(194)),
+            egui::StrokeKind::Inside,
+        );
+    }
     if let Some(icon) = icon {
-        let origin = egui::pos2(response.rect.left() + 15.0, response.rect.center().y);
+        let origin = egui::pos2(response.rect.left() + 18.0, response.rect.center().y);
         let point = |x, y| origin + egui::vec2(x, y);
         let painter = ui.painter();
-        let stroke = egui::Stroke::new(1.4_f32, color);
+        let stroke = egui::Stroke::new(1.5_f32, if active { YELLOW } else { color });
         let line = |points: &[(f32, f32)]| {
             painter.add(egui::Shape::line(
                 points.iter().map(|&(x, y)| point(x, y)).collect(),
@@ -2466,16 +2486,21 @@ fn nav_item(ui: &mut egui::Ui, label: &str, icon: Option<Page>, active: bool) ->
                 }
             }
             Page::Playlists => {
-                painter.circle_stroke(origin, 3.0, stroke);
-                painter.circle_stroke(origin, 1.0, stroke);
+                line(&[(-6.0, -4.0), (1.0, -4.0)]);
+                line(&[(-6.0, 0.0), (-1.0, 0.0)]);
+                line(&[(3.0, 3.0), (3.0, -3.0), (6.0, -4.0)]);
+                painter.circle_filled(point(1.5, 4.0), 2.0, stroke.color);
             }
             Page::Artist => {
                 painter.circle_stroke(point(0.0, -3.0), 3.0, stroke);
                 line(&[(-5.5, 6.0), (-3.0, 2.0), (3.0, 2.0), (5.5, 6.0)]);
             }
             Page::Settings => {
-                painter.circle_stroke(origin, 5.0, stroke);
-                painter.circle_stroke(origin, 1.8, stroke);
+                for (y, x) in [(-4.0, 2.0), (3.0, -2.0)] {
+                    line(&[(-6.0, y), (x - 2.0, y)]);
+                    line(&[(x + 2.0, y), (6.0, y)]);
+                    painter.circle_stroke(point(x, y), 2.0, stroke);
+                }
             }
         }
     }
@@ -2859,6 +2884,103 @@ mod tests {
 
 #[cfg(test)]
 mod card_layout_tests {
+    #[test]
+    fn settings_can_be_clicked_after_scrolling_short_navigation() {
+        let ctx = Context::default();
+        let mut app = App::new_internal(&ctx, false, None);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(560.0, 240.0));
+        let mut frame = |events: Vec<egui::Event>| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.nav(ctx, &Snapshot::default()),
+            )
+        };
+        frame(vec![]);
+        let cursor = egui::pos2(86.0, 180.0);
+        let mut output = frame(vec![
+            egui::Event::PointerMoved(cursor),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -450.0),
+                modifiers: Default::default(),
+            },
+        ]);
+        for _ in 0..25 {
+            output = frame(vec![]);
+        }
+        let mut labels = Vec::new();
+        for shape in output.shapes {
+            text_shapes(&shape.shape, &mut labels);
+        }
+        let target = labels
+            .iter()
+            .find(|l| l.0 == "Настройки")
+            .expect("settings visible")
+            .2
+            .center();
+        assert!(screen.contains(target));
+        for pressed in [true, false] {
+            frame(vec![
+                egui::Event::PointerMoved(target),
+                egui::Event::PointerButton {
+                    pos: target,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                },
+            ]);
+        }
+        assert!(app.page == Page::Settings);
+    }
+    #[test]
+    fn navigation_reopens_search_and_playlist_overview() {
+        let mut app = App::new_internal(&Context::default(), false, None);
+        app.navigate(Page::Search, false);
+        app.focus_search = false;
+        app.navigate(Page::Search, false);
+        assert!(app.focus_search);
+        app.navigate(Page::Playlists, false);
+        app.opened_playlist =
+            Some(serde_json::from_value(json!({"id":"1","title":"Mix"})).unwrap());
+        app.navigate(Page::Playlists, false);
+        assert!(app.opened_playlist.is_none());
+    }
+
+    #[test]
+    fn focused_navigation_activates_without_playback_shortcut() {
+        let ctx = Context::default();
+        let mut app = App::new_internal(&ctx, false, None);
+        let (tx, rx) = std::sync::mpsc::sync_channel(4);
+        app.tx = tx;
+
+        let mut hits = 0;
+        for key in [None, Some(Key::Tab), Some(Key::Space), Some(Key::Enter)] {
+            let mut input = egui::RawInput::default();
+            if let Some(key) = key {
+                input.events.push(egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Default::default(),
+                });
+            }
+            let _ = ctx.run(input, |ctx| {
+                app.shortcuts(ctx, &Snapshot::default());
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    if nav_item(ui, "Очередь", Some(Page::Queue), false) {
+                        hits += 1;
+                    }
+                });
+            });
+        }
+        assert_eq!(hits, 2);
+        assert!(rx.try_recv().is_err());
+    }
     #[test]
     fn short_navigation_scrolls_without_overlapping_settings_and_queue() {
         let ctx = Context::default();
