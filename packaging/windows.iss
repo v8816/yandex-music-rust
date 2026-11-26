@@ -17,6 +17,10 @@ OutputBaseFilename=YandexMusicRust-{#AppVersion}-Setup
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
+#ifdef ReleaseSigning
+SignTool=release
+SignedUninstaller=yes
+#endif
 
 [Languages]
 Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"

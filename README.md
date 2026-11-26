@@ -39,6 +39,14 @@ cargo build --locked --release
 
 Установщик собирается командой `powershell -ExecutionPolicy Bypass -File packaging/build-windows-installer.ps1` после release-сборки. Требуется Inno Setup 6.3 или новее.
 
+Для подписанной сборки нужен доверенный сертификат подписи кода с ключом, доступный в `Cert:\CurrentUser\My`, и `signtool.exe` из Windows SDK:
+
+```powershell
+./packaging/build-windows-installer.ps1 -RequireSignature -SigningThumbprint $thumbprint -SignToolPath $signtool
+```
+
+Скрипт подписывает копию плеера, а Inno Setup подписывает установщик, его временные копии и программу удаления. Перед публикацией проверьте установку на чистой Windows с включённым Smart App Control.
+
 ## MCP
 
 В настройках скопируйте конфигурацию MCP. Она запускает тот же EXE с `--mcp`, портом и ключом в переменной окружения `YANDEX_MUSIC_MCP_KEY`. Плеер должен работать; после перезапуска скопируйте новую конфигурацию. Доступны состояние, поиск, очередь, управление воспроизведением, любимое, плейлисты и волна.
