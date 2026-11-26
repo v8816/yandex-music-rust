@@ -271,7 +271,10 @@ fn yandex_cover_host(url: &Url) -> bool {
     url.host_str().is_some_and(|host| {
         matches!(
             host,
-            "avatars.yandex.net" | "avatars.mds.yandex.net" | "avatars.yandex.ru"
+            "avatars.yandex.net"
+                | "avatars.mds.yandex.net"
+                | "avatars.yandex.ru"
+                | "music-avatars.music.yandex.net"
         )
     })
 }
@@ -369,6 +372,12 @@ mod tests {
         );
         assert!(cover_url("https://example.com/cover.png").is_none());
         assert_eq!(
+            cover_url("music-avatars.music.yandex.net/get-music-content/1/%%")
+                .unwrap()
+                .as_str(),
+            "https://music-avatars.music.yandex.net/get-music-content/1/100x100"
+        );
+        assert_eq!(
             cover_url("http://avatars.yandex.net/cover.png")
                 .unwrap()
                 .as_str(),
@@ -378,6 +387,12 @@ mod tests {
 
     #[test]
     fn cover_redirects_stay_on_https_yandex_artwork_hosts() {
+        assert!(cover_host_allowed(
+            &Url::parse("https://music-avatars.music.yandex.net/cover.png").unwrap()
+        ));
+        assert!(!cover_host_allowed(
+            &Url::parse("https://music-avatars.music.yandex.net.example.com/cover.png").unwrap()
+        ));
         assert!(cover_host_allowed(
             &Url::parse("https://avatars.mds.yandex.net/cover.png").unwrap()
         ));
