@@ -12,7 +12,9 @@ use std::{
 };
 
 const MAX_COVERS: usize = 40;
-const MAX_BYTES: u64 = 1024 * 1024;
+const MAX_BYTES: u64 = 2 * 1024 * 1024;
+const LARGE_SIZE: &str = "600x600";
+const MEDIUM_SIZE: &str = "200x200";
 const UNAVAILABLE_RETRY: Duration = Duration::from_secs(5);
 type LoadedCover = (String, Result<ColorImage, String>);
 
@@ -108,8 +110,12 @@ impl Covers {
             Some((_, Cover::Ready(_, color))) => Some(*color),
             _ => None,
         };
-        uri.and_then(|uri| ready_color(uri).or_else(|| ready_color(&uri.replace("%%", "400x400"))))
-            .unwrap_or(Color32::from_rgb(65, 45, 90))
+        uri.and_then(|uri| {
+            ready_color(&uri.replace("%%", LARGE_SIZE))
+                .or_else(|| ready_color(&uri.replace("%%", MEDIUM_SIZE)))
+                .or_else(|| ready_color(uri))
+        })
+        .unwrap_or(Color32::from_rgb(65, 45, 90))
     }
 
     pub fn draw(&mut self, ui: &mut egui::Ui, uri: Option<&str>, size: f32) -> egui::Response {
@@ -118,23 +124,39 @@ impl Covers {
         if !ui.is_rect_visible(rect) {
             return response;
         }
-        let large_uri = if size >= 200.0 {
-            uri.map(|uri| uri.replace("%%", "400x400"))
+        let pixels = size * ui.ctx().pixels_per_point();
+        let preferred_size = if size >= 176.0 || (size >= 128.0 && pixels > 320.0) {
+            Some(LARGE_SIZE)
+        } else if pixels > 100.0 {
+            Some(MEDIUM_SIZE)
         } else {
             None
         };
+        let large_uri = preferred_size
+            .zip(uri.filter(|uri| uri.contains("%%")))
+            .map(|(size, uri)| uri.replace("%%", size));
         let large_failed = large_uri.as_deref().is_some_and(|large_uri| {
             matches!(
                 self.entries.get(large_uri).map(|(_, cover)| cover),
                 Some(Cover::Unavailable { .. })
             )
         });
-        let requested_uri = if large_failed && large_uri.as_deref() != uri {
-            uri
-        } else {
-            large_uri.as_deref().or(uri)
-        };
-        let texture = requested_uri.and_then(|uri| self.texture(ui.ctx(), uri));
+        let requested_uri = large_uri.as_deref().or(uri);
+        let texture = requested_uri
+            .and_then(|uri| self.texture(ui.ctx(), uri))
+            .or_else(|| {
+                let fallback = uri.filter(|uri| Some(*uri) != requested_uri)?;
+                if large_failed
+                    || matches!(
+                        self.entries.get(fallback),
+                        Some((_, Cover::Ready(..) | Cover::Loading))
+                    )
+                {
+                    self.texture(ui.ctx(), fallback)
+                } else {
+                    None
+                }
+            });
         if let Some(id) = texture {
             let image = egui::Image::new((id, rect.size())).corner_radius(8);
             image.paint_at(ui, rect);
@@ -171,14 +193,9 @@ impl Covers {
                     Cover::Unavailable { reason, .. } => Some(reason.as_str()),
                     _ => None,
                 })
-                .or_else(|| {
-                    large_uri
-                        .as_deref()
-                        .and_then(|uri| self.entries.get(uri))
-                        .and_then(|(_, cover)| match cover {
-                            Cover::Unavailable { reason, .. } => Some(reason.as_str()),
-                            _ => None,
-                        })
+                .or_else(|| match uri.and_then(|uri| self.entries.get(uri)) {
+                    Some((_, Cover::Unavailable { reason, .. })) => Some(reason.as_str()),
+                    _ => None,
                 });
             if let Some(reason) = reason {
                 response = response.on_hover_text(reason);
@@ -208,9 +225,23 @@ impl Covers {
         {
             self.entries.remove(uri);
         }
-        if uri.contains("400x400") {
-            self.entries
-                .retain(|key, _| key == uri || !key.contains("400x400"));
+        if uri.contains(LARGE_SIZE)
+            && self
+                .entries
+                .keys()
+                .filter(|key| key.contains(LARGE_SIZE))
+                .count()
+                >= 2
+        {
+            let oldest = self
+                .entries
+                .iter()
+                .filter(|(key, (_, cover))| {
+                    key.contains(LARGE_SIZE) && !matches!(cover, Cover::Loading)
+                })
+                .min_by_key(|(_, (seen, _))| *seen)
+                .map(|(key, _)| key.clone())?;
+            self.entries.remove(&oldest);
         }
         if self.entries.len() >= MAX_COVERS {
             let oldest = self
@@ -323,7 +354,7 @@ fn download(client: &Client, uri: &str) -> Result<ColorImage, String> {
         ));
     }
     if response.content_length().unwrap_or(0) > MAX_BYTES {
-        return Err("Файл обложки превышает 1 МБ".into());
+        return Err("Файл обложки превышает 2 МБ".into());
     }
     let mut bytes = Vec::new();
     response
@@ -331,14 +362,14 @@ fn download(client: &Client, uri: &str) -> Result<ColorImage, String> {
         .read_to_end(&mut bytes)
         .map_err(|error| format!("Не удалось прочитать файл обложки: {error}"))?;
     if bytes.len() as u64 > MAX_BYTES {
-        return Err("Файл обложки превышает 1 МБ".into());
+        return Err("Файл обложки превышает 2 МБ".into());
     }
     let mut reader = image::ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|_| "Сервер прислал неизвестный формат обложки".to_owned())?;
     let mut limits = image::Limits::default();
-    limits.max_image_width = Some(512);
-    limits.max_image_height = Some(512);
+    limits.max_image_width = Some(768);
+    limits.max_image_height = Some(768);
     limits.max_alloc = Some(8 * 1024 * 1024);
     reader.limits(limits);
     let pixels = reader

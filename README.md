@@ -4,7 +4,7 @@
 
 **[Скачать для Windows x64](https://github.com/v8816/yandex-music-rust/releases/latest)** · [Сообщить об ошибке](https://github.com/v8816/yandex-music-rust/issues/new)
 
-*Unofficial Yandex Music desktop client for Windows, built in Rust. Portable EXE with low RAM usage.*
+*Unofficial Yandex Music desktop client for Windows, built in Rust. Low RAM usage and a per-user installer.*
 
 ## Сколько ОЗУ занимает плеер
 
@@ -23,7 +23,7 @@
 
 ## Запуск
 
-Скачайте сборку из GitHub Releases и запустите EXE. Если скачали ZIP, сначала распакуйте его. Для полного доступа к музыке нужны аккаунт и действующая подписка Яндекс Плюс. Для аппаратной отрисовки запустите EXE с флагом `--gpu`.
+Скачайте установщик из GitHub Releases и запустите его. После установки плеер можно найти в меню «Пуск» по названию «Яндекс Музыка Rust». Установка не требует прав администратора. Для полного доступа к музыке нужны аккаунт и действующая подписка Яндекс Плюс. Для аппаратной отрисовки запустите установленный EXE с флагом `--gpu`.
 
 Вход — в настройках через Яндекс ID. «Запомнить» хранит токен в Windows Credential Manager в профиле текущего пользователя и сохраняет его между входами в Windows. Не передавайте токен и MCP-конфигурацию другим людям.
 
@@ -36,6 +36,8 @@ cargo build --locked --release
 ```
 
 Результат: `target/release/yandex-music-rust.exe`. Требуются Rust stable и Visual Studio Build Tools с Windows SDK.
+
+Установщик собирается командой `powershell -ExecutionPolicy Bypass -File packaging/build-windows-installer.ps1` после release-сборки. Требуется Inno Setup 6.3 или новее.
 
 ## MCP
 
