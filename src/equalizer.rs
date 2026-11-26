@@ -3,12 +3,21 @@ use serde::{Deserialize, Serialize};
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
     },
     time::Duration,
 };
 
 pub const FREQUENCIES: [f32; 5] = [60.0, 250.0, 1000.0, 4000.0, 12000.0];
+pub const PRESETS: [(&str, [i8; FREQUENCIES.len()]); 7] = [
+    ("Ровный", [0, 0, 0, 0, 0]),
+    ("Больше баса", [5, 2, 0, 0, 0]),
+    ("Вокал", [-2, -2, 2, 4, 0]),
+    ("Рок", [3, 1, -1, 2, 3]),
+    ("Электроника", [4, 1, -2, 1, 4]),
+    ("Джаз", [2, 0, 1, 2, 2]),
+    ("Больше высоких", [0, 0, 0, 2, 5]),
+];
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
@@ -16,13 +25,25 @@ pub struct Settings {
     pub gains: [i8; FREQUENCIES.len()],
 }
 
-#[derive(Clone, Default)]
-pub struct Control(Arc<AtomicU64>);
+#[derive(Clone)]
+pub struct Control {
+    settings: Arc<AtomicU64>,
+    volume: Arc<AtomicU32>,
+}
+
+impl Default for Control {
+    fn default() -> Self {
+        Self {
+            settings: Arc::new(AtomicU64::new(0)),
+            volume: Arc::new(AtomicU32::new(1.0_f32.to_bits())),
+        }
+    }
+}
 
 impl Control {
     pub fn set(&self, settings: Settings) {
         let [bass, low_mid, mid, high_mid, treble] = settings.gains.map(|gain| gain as u8);
-        self.0.store(
+        self.settings.store(
             u64::from_le_bytes([
                 bass,
                 low_mid,
@@ -35,6 +56,10 @@ impl Control {
             ]),
             Ordering::Relaxed,
         );
+    }
+
+    pub fn set_volume(&self, volume: f32) {
+        self.volume.store(volume.to_bits(), Ordering::Relaxed);
     }
 }
 
@@ -69,6 +94,34 @@ impl Filter {
         delay[1] = self.b2 * input - self.a2 * out;
         out
     }
+
+    fn power_response(self, cos: f64, sin: f64) -> f64 {
+        // Evaluate the biquad at a point on the unit circle.
+        let power = |a: f32, b: f32, c: f32| {
+            let (a, b, c) = (f64::from(a), f64::from(b), f64::from(c));
+            ((a + c) * cos + b).powi(2) + ((a - c) * sin).powi(2)
+        };
+        power(self.b0, self.b1, self.b2) / power(1.0, self.a1, self.a2)
+    }
+}
+
+fn headroom(filters: &[Option<Filter>], rate: SampleRate) -> f32 {
+    let nyquist = f64::from(rate) * 0.5;
+    let mut peak_power = 1.0_f64;
+    let frequencies = FREQUENCIES
+        .into_iter()
+        .map(f64::from)
+        .chain((0..=256).map(|step| 10.0 * (nyquist / 10.0).powf(f64::from(step) / 256.0)));
+    for hz in frequencies.filter(|hz| *hz <= nyquist) {
+        let (sin, cos) = (std::f64::consts::PI * hz / nyquist).sin_cos();
+        let power = filters
+            .iter()
+            .flatten()
+            .map(|filter| filter.power_response(cos, sin))
+            .product::<f64>();
+        peak_power = peak_power.max(power);
+    }
+    peak_power.sqrt().recip() as f32
 }
 
 pub struct Equalized<S> {
@@ -81,6 +134,7 @@ pub struct Equalized<S> {
     filters: [Option<Filter>; FREQUENCIES.len()],
     delays: Vec<[[f32; 2]; FREQUENCIES.len()]>,
     headroom: f32,
+    volume: f32,
     active: bool,
 }
 
@@ -98,12 +152,14 @@ impl<S: Source> Equalized<S> {
             filters: [None; FREQUENCIES.len()],
             delays,
             headroom: 1.0,
+            volume: 1.0,
             active: false,
         }
     }
 
     fn refresh(&mut self) {
-        let settings = self.control.0.load(Ordering::Relaxed);
+        self.volume = f32::from_bits(self.control.volume.load(Ordering::Relaxed));
+        let settings = self.control.settings.load(Ordering::Relaxed);
         let rate = self.source.sample_rate();
         let channels = usize::from(self.source.channels());
         if self.applied == Some(settings) && self.rate == rate && self.delays.len() == channels {
@@ -117,11 +173,9 @@ impl<S: Source> Equalized<S> {
         self.delays.resize(channels, [[0.0; 2]; FREQUENCIES.len()]);
         let bytes = settings.to_le_bytes();
         let enabled = bytes[5] != 0;
-        let mut boost_db = 0.0_f32;
         for (index, &hz) in FREQUENCIES.iter().enumerate() {
             let gain = bytes[index] as i8;
             let filter = if enabled && gain != 0 && hz < rate as f32 * 0.48 {
-                boost_db = boost_db.max(f32::from(gain));
                 Some(Filter::peaking(hz, gain, rate))
             } else {
                 None
@@ -130,7 +184,15 @@ impl<S: Source> Equalized<S> {
         }
         self.delays.fill([[0.0; 2]; FREQUENCIES.len()]);
         self.active = self.filters.iter().any(Option::is_some);
-        self.headroom = 10.0_f32.powf(-boost_db / 20.0);
+        self.headroom = if enabled
+            && bytes[..FREQUENCIES.len()]
+                .iter()
+                .any(|&gain| gain as i8 > 0)
+        {
+            headroom(&self.filters, rate)
+        } else {
+            1.0
+        };
     }
 }
 
@@ -151,15 +213,15 @@ impl<S: Source> Iterator for Equalized<S> {
             0
         };
         if !self.active {
-            return Some(sample);
+            return Some(sample * self.volume);
         }
-        let mut out = sample * self.headroom;
+        let mut out = sample;
         for (filter, delay) in self.filters.iter().zip(&mut self.delays[channel]) {
             if let Some(filter) = filter {
                 out = filter.apply(out, delay);
             }
         }
-        Some(out.clamp(-1.0, 1.0))
+        Some((out * self.headroom * self.volume).clamp(-1.0, 1.0))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -193,6 +255,34 @@ impl<S: Source> Source for Equalized<S> {
 mod tests {
     use super::*;
     use rodio::buffer::SamplesBuffer;
+
+    #[test]
+    fn changing_volume_preserves_the_equalized_waveform_with_overlapping_boosts() {
+        let rate = 48_000;
+        let input = (0..rate / 2)
+            .map(|frame| (std::f32::consts::TAU * 250.0 * frame as f32 / rate as f32).sin())
+            .collect::<Vec<_>>();
+        let render = |volume| {
+            let control = Control::default();
+            control.set(Settings {
+                enabled: true,
+                gains: [12; FREQUENCIES.len()],
+            });
+            control.set_volume(volume);
+            Equalized::new(SamplesBuffer::new(1, rate, input.clone()), control)
+                .skip(rate as usize / 4)
+                .collect::<Vec<_>>()
+        };
+        let full = render(1.0);
+        let half = render(0.5);
+        let peak = full.iter().map(|sample| sample.abs()).fold(0.0, f32::max);
+        assert!((0.7..1.0).contains(&peak), "peak: {peak}");
+        assert!(
+            full.iter()
+                .zip(half)
+                .all(|(full, half)| (full * 0.5 - half).abs() < 1e-5)
+        );
+    }
 
     #[test]
     fn boosts_the_selected_band_relative_to_others_without_channel_bleed() {

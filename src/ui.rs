@@ -2,7 +2,7 @@ use crate::{
     api::{ArtistInfo, Playlist, Track},
     auth::{self, BrowserLogin},
     covers::Covers,
-    equalizer::{FREQUENCIES, Settings as EqualizerSettings},
+    equalizer::{FREQUENCIES, PRESETS, Settings as EqualizerSettings},
     mcp::Bridge,
     media::{self, MediaKeys},
     player::{self, Job, Reply, Snapshot},
@@ -2053,14 +2053,25 @@ impl App {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     commit |= ui.checkbox(&mut self.eq_draft.enabled, "Включён").changed();
-                    if ui
-                        .button("Сбросить")
-                        .on_hover_text("Установить все полосы на 0 дБ")
-                        .clicked()
-                    {
-                        self.eq_draft.gains.fill(0);
-                        commit = true;
-                    }
+                    let preset_name = PRESETS
+                        .iter()
+                        .find(|(_, gains)| *gains == self.eq_draft.gains)
+                        .map_or("Вручную", |(name, _)| *name);
+                    egui::ComboBox::from_id_salt("equalizer_preset")
+                        .selected_text(preset_name)
+                        .width(132.0)
+                        .show_ui(ui, |ui| {
+                            for (name, gains) in PRESETS {
+                                if ui
+                                    .selectable_label(gains == self.eq_draft.gains, name)
+                                    .clicked()
+                                {
+                                    self.eq_draft.gains = gains;
+                                    self.eq_draft.enabled = true;
+                                    commit = true;
+                                }
+                            }
+                        });
                 });
                 ui.separator();
                 ui.horizontal_top(|ui| {
