@@ -368,7 +368,12 @@ mod tests {
             Some("avatars.mds.yandex.net")
         );
         assert!(cover_url("https://example.com/cover.png").is_none());
-        assert!(cover_url("http://avatars.yandex.net/cover.png").is_none());
+        assert_eq!(
+            cover_url("http://avatars.yandex.net/cover.png")
+                .unwrap()
+                .as_str(),
+            "https://avatars.yandex.net/cover.png"
+        );
     }
 
     #[test]
