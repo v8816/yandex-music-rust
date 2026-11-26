@@ -324,7 +324,7 @@ impl Player {
         }
         let sink = Sink::connect_new(self.stream.as_ref().unwrap().mixer());
         sink.pause();
-        sink.set_volume(self.state.volume);
+        self.eq_control.set_volume(self.state.volume);
         sink.append(Equalized::new(audio, self.eq_control.clone()));
         if let Some(position) = self.resume_position.take().filter(|seconds| *seconds > 0.0)
             && let Err(error) = sink.try_seek(Duration::from_secs_f64(position))
@@ -989,9 +989,7 @@ impl Player {
                     "Громкость должна быть от 0 до 1"
                 );
                 self.state.volume = volume as f32;
-                if let Some(sink) = &self.sink {
-                    sink.set_volume(self.state.volume);
-                }
+                self.eq_control.set_volume(self.state.volume);
             }
             "like" | "unlike" => {
                 let id = if a.get("track_id").is_some() {
