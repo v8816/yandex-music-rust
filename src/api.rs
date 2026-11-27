@@ -331,13 +331,24 @@ impl Api {
         Ok(body.get_mut("result").map(Value::take).unwrap_or(body))
     }
 
-    pub fn wave_start(&self, seed_track: Option<u64>, queue: Vec<String>) -> Result<WaveBatch> {
-        let seed =
-            seed_track.map_or_else(|| "user:onyourwave".to_owned(), |id| format!("track:{id}"));
+    pub fn wave_start(
+        &self,
+        seed_track: Option<u64>,
+        mood: Option<&str>,
+        queue: Vec<String>,
+    ) -> Result<WaveBatch> {
+        let seeds = match (seed_track, mood) {
+            (Some(id), _) => vec![format!("track:{id}")],
+            (None, Some(setting)) if setting.starts_with("setting") => {
+                vec!["user:onyourwave".to_owned(), setting.to_owned()]
+            }
+            (None, Some(mood)) => vec![mood.to_owned()],
+            (None, None) => vec!["user:onyourwave".to_owned()],
+        };
         self.wave_request(
             "rotor/session/new",
             json!({
-                "seeds":[seed], "includeTracksInResponse":true, "interactive":true,
+                "seeds":seeds, "includeTracksInResponse":true, "interactive":true,
                 "queue":queue
             }),
         )
@@ -348,6 +359,7 @@ impl Api {
         session: &str,
         queue: Vec<String>,
         seed_track: Option<u64>,
+        mood: Option<&str>,
     ) -> Result<WaveBatch> {
         ensure!(valid_session(session), "Некорректный номер сессии");
         let batch = self.wave_request(
@@ -355,7 +367,7 @@ impl Api {
             json!({"queue":&queue}),
         )?;
         if batch.unknown_session {
-            self.wave_start(seed_track, queue)
+            self.wave_start(seed_track, mood, queue)
         } else {
             Ok(batch)
         }
@@ -1042,12 +1054,12 @@ mod tests {
     #[ignore = "calls the live public Rotor metadata API"]
     fn wave_metadata_decodes_and_continues() {
         let api = Api::new().unwrap();
-        let first = api.wave_start(None, vec![]).unwrap();
+        let first = api.wave_start(None, None, vec![]).unwrap();
         let id = first.radio_session_id.clone().unwrap();
         let tracks = first.tracks();
         assert!(!tracks.is_empty());
         let queue = tracks.iter().map(|track| track.id.to_string()).collect();
-        let next = api.wave_more(&id, queue, None).unwrap();
+        let next = api.wave_more(&id, queue, None, None).unwrap();
         assert!(
             next.tracks()
                 .iter()

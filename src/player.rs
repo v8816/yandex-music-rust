@@ -59,6 +59,8 @@ pub struct Snapshot {
     pub wave_undo: bool,
     #[serde(default)]
     pub wave_station: Option<WaveStation>,
+    #[serde(default)]
+    pub wave_mood: Option<String>,
     pub equalizer: equalizer::Settings,
     pub logged_in: bool,
     #[serde(skip_serializing, default)]
@@ -176,6 +178,7 @@ type ReadTask = (Api, String, Value, mpsc::Sender<Reply>);
 #[derive(Clone)]
 struct Wave {
     station: WaveStation,
+    mood: Option<String>,
     session: String,
     batches: HashMap<u64, String>,
 }
@@ -258,6 +261,7 @@ impl Player {
         let mut s = self.state.clone();
         s.wave_undo = self.wave_history.is_some();
         s.wave_station = self.wave.as_ref().map(|wave| wave.station.clone());
+        s.wave_mood = self.wave.as_ref().and_then(|wave| wave.mood.clone());
         if let Some(sink) = &self.sink {
             s.position = sink.get_pos().as_secs_f64();
             s.playing = !sink.is_paused() && !sink.empty();
@@ -474,12 +478,19 @@ impl Player {
         ));
     }
 
-    fn start_wave(&mut self, station: WaveStation, exclude: Vec<String>) -> Result<()> {
+    fn start_wave(
+        &mut self,
+        station: WaveStation,
+        mood: Option<String>,
+        exclude: Vec<String>,
+    ) -> Result<()> {
         ensure!(
             self.state.logged_in,
             "Войдите в Яндекс ID, чтобы запустить Мою волну"
         );
-        let response = self.api.wave_start(station.seed_track, exclude)?;
+        let response = self
+            .api
+            .wave_start(station.seed_track, mood.as_deref(), exclude)?;
         let session = response
             .radio_session_id
             .clone()
@@ -501,6 +512,7 @@ impl Player {
         self.wave_retry = None;
         self.wave = Some(Wave {
             station,
+            mood,
             session,
             batches,
         });
@@ -522,6 +534,7 @@ impl Player {
         };
         let session = wave.session.clone();
         let seed_track = wave.station.seed_track;
+        let mood = wave.mood.clone();
         let queue = self
             .state
             .queue
@@ -537,7 +550,7 @@ impl Player {
         let (tx, rx) = mpsc::channel();
         let key = session.clone();
         thread::spawn(move || {
-            let _ = tx.send(api.wave_more(&key, queue, seed_track));
+            let _ = tx.send(api.wave_more(&key, queue, seed_track, mood.as_deref()));
         });
         self.wave_pending = Some((session, rx));
         self.wave_retry = Some(Instant::now());
@@ -574,6 +587,7 @@ impl Player {
             &wave.session,
             queue.into_iter().rev().collect(),
             wave.station.seed_track,
+            wave.mood.as_deref(),
         )?;
         self.append_wave(batch)
     }
@@ -851,7 +865,15 @@ impl Player {
                 let tracks = self.api.search(query()?)?;
                 self.replace_queue(tracks, 0)?;
             }
-            "wave_start" => self.start_wave(WaveStation::default(), Vec::new())?,
+            "wave_start" => self.start_wave(WaveStation::default(), None, Vec::new())?,
+            "wave_mood" => {
+                let mood = a["mood"].as_str().context("Укажите настрой волны")?;
+                ensure!(
+                    crate::preferences::WAVE_MOOD_IDS.contains(&mood),
+                    "Неизвестный настрой волны"
+                );
+                self.start_wave(WaveStation::default(), Some(mood.to_owned()), Vec::new())?;
+            }
             "wave_track" => {
                 let title = a["title"]
                     .as_str()
@@ -864,6 +886,7 @@ impl Player {
                         seed_track: Some(track_id()?),
                         title,
                     },
+                    None,
                     Vec::new(),
                 )?;
             }
@@ -887,6 +910,7 @@ impl Player {
                     .filter(|&index| index < self.state.queue.len())
                     .context("Очередь волны пуста")?;
                 let station = wave.station.clone();
+                let mood = wave.mood.clone();
                 let history = WaveHistory {
                     wave,
                     tracks: self.state.queue.clone(),
@@ -905,7 +929,7 @@ impl Player {
                     .take(60)
                     .map(|track| track.id.to_string())
                     .collect();
-                self.start_wave(station, exclude)?;
+                self.start_wave(station, mood, exclude)?;
                 self.wave_history = Some(history);
             }
             "play_track" => {
@@ -1109,6 +1133,7 @@ mod wave_history_tests {
         .unwrap();
         player.wave_history = Some(WaveHistory {
             wave: Wave {
+                mood: None,
                 station: WaveStation {
                     seed_track: Some(12),
                     title: "First".into(),

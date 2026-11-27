@@ -72,6 +72,48 @@ impl Default for WaveStation {
     }
 }
 
+pub(crate) const WAVE_MOOD_IDS: &[&str] = &[
+    "mood:calm",
+    "mood:happy",
+    "mood:sad",
+    "mood:energetic",
+    "mood:dream",
+    "mood:dark",
+    "mood:epic",
+    "mood:relaxed",
+    "activity:study-background",
+    "activity:work-background",
+    "activity:wake-up",
+    "activity:run",
+    "activity:workout",
+    "activity:driving",
+    "activity:road-trip",
+    "activity:party",
+    "activity:fall-asleep",
+    "genre:alternative",
+    "genre:indie",
+    "genre:phonkgenre",
+    "genre:ambientgenre",
+    "genre:postpunk",
+    "genre:jazz",
+    "genre:electronics",
+    "genre:allrock",
+    "genre:classical",
+    "genre:rap",
+    "genre:soundtrack",
+    "micro-genre:alternative-pop-rock",
+    "micro-genre:alternative-indie-rock",
+    "epoch:eighties",
+    "epoch:nineties",
+    "epoch:zeroes",
+    "settingDiversity:discover",
+    "settingDiversity:favorite",
+    "settingDiversity:popular",
+    "settingLanguage:russian",
+    "settingLanguage:not-russian",
+    "settingLanguage:without-words",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
