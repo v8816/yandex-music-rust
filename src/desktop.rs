@@ -87,7 +87,7 @@ impl Tray {
         };
         let menu = Menu::new();
         let show = MenuItem::new("Открыть плеер", true, None);
-        let play = MenuItem::new("Играть / пауза", true, None);
+        let play = MenuItem::new("Воспроизведение / пауза", true, None);
         let next = MenuItem::new("Следующий трек", true, None);
         let quit = MenuItem::new("Выйти", true, None);
         menu.append_items(&[&show, &play, &next, &quit]).ok()?;
