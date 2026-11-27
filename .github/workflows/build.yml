@@ -19,11 +19,14 @@ jobs:
         run: cargo test --locked
       - name: Сборка
         run: cargo build --locked --release
-      - name: Установщик
-        run: ./packaging/build-windows-installer.ps1
+      - name: Пакеты Windows
+        run: ./packaging/build-windows-installer.ps1 -BuildReleaseAssets
       - uses: actions/upload-artifact@v4
         with:
-          name: yandex-music-rust-windows-x64-setup
+          name: yandex-music-rust-windows-x64-release-assets
           path: |
             target/installer/*-Setup.exe
+            target/installer/*-Windows-x64.zip
+            target/installer/*-Windows-x64.exe
+            target/installer/*-Windows-x64.exe.sha256
           if-no-files-found: error

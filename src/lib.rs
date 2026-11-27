@@ -14,4 +14,6 @@ mod rpc;
 mod software_window;
 pub mod stream;
 pub mod ui;
+#[cfg(windows)]
+pub mod updater;
 mod worker;

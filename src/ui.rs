@@ -22,6 +22,23 @@ use std::{
 
 const YELLOW: Color32 = Color32::from_rgb(255, 220, 60);
 const MIN_VOLUME_DB: f32 = -60.0;
+const SURFACE: Color32 = Color32::from_rgb(27, 27, 30);
+const MUTED: Color32 = Color32::from_gray(167);
+
+#[cfg(windows)]
+#[derive(Default)]
+enum UpdateUi {
+    #[default]
+    Idle,
+    Checking(
+        Receiver<anyhow::Result<Option<crate::updater::Update>>>,
+        bool,
+    ),
+    Offer(crate::updater::Update),
+    Installing(crate::updater::Update, Receiver<anyhow::Result<()>>),
+    Failed(crate::updater::Update, String),
+    Status(String),
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
@@ -75,6 +92,8 @@ pub(crate) struct App {
     #[cfg(windows)]
     tray: Option<crate::desktop::Tray>,
     quitting: bool,
+    #[cfg(windows)]
+    updates: UpdateUi,
     detail_track: Option<Track>,
     detail_playback_id: Option<u64>,
     recommendations: Vec<Track>,
@@ -121,22 +140,24 @@ impl App {
     pub(crate) fn new_internal(ctx: &Context, connect: bool, window: Option<isize>) -> Self {
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = Color32::from_rgb(17, 17, 20);
+        visuals.window_fill = SURFACE;
+        visuals.window_corner_radius = 12.into();
+        visuals.window_shadow = egui::epaint::Shadow::NONE;
         visuals.extreme_bg_color = Color32::from_gray(13);
         visuals.widgets.inactive.bg_fill = Color32::from_gray(37);
-        visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(36, 36, 43);
-        visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(57, 55, 67);
+        visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(36, 36, 39);
+        visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(48, 48, 51);
         for widget in [
             &mut visuals.widgets.inactive,
             &mut visuals.widgets.hovered,
             &mut visuals.widgets.active,
         ] {
-            widget.corner_radius = 10.into();
-            widget.bg_stroke = egui::Stroke::NONE;
+            widget.corner_radius = 8.into();
         }
         visuals.selection.bg_fill = Color32::from_rgb(105, 86, 16);
         ctx.set_visuals(visuals);
         ctx.style_mut(|style| {
-            style.spacing.item_spacing = egui::vec2(10.0, 9.0);
+            style.spacing.item_spacing = egui::vec2(8.0, 8.0);
             style.spacing.button_padding = egui::vec2(12.0, 6.0);
         });
         let mut fonts = FontDefinitions::default();
@@ -217,6 +238,8 @@ impl App {
             #[cfg(windows)]
             tray,
             quitting: false,
+            #[cfg(windows)]
+            updates: UpdateUi::Idle,
             detail_track: None,
             detail_playback_id: None,
             recommendations: Vec::new(),
@@ -228,6 +251,8 @@ impl App {
         if !connect {
             return app;
         }
+        #[cfg(windows)]
+        app.check_updates(ctx, false);
         match media::start(app.tx.clone(), app.state.clone()) {
             Some(keys) => app.media = Some(keys),
             None => {
@@ -644,10 +669,7 @@ impl App {
 
     fn settings(&mut self, ui: &mut egui::Ui, s: &Snapshot) {
         ui.label(RichText::new("Настройки").size(30.0).strong());
-        ui.label(
-            RichText::new("Аккаунт, звук и подключённые приложения").color(Color32::from_gray(165)),
-        );
-        ui.add_space(10.0);
+        ui.add_space(8.0);
         ScrollArea::vertical().id_salt("settings").show(ui, |ui| {
             card().show(ui, |ui| {
                 ui.set_width(ui.available_width());
@@ -665,7 +687,7 @@ impl App {
                 }
                 let mut lossless = s.lossless;
                 if ui
-                    .checkbox(&mut lossless, "Запрашивать lossless при загрузке трека")
+                    .checkbox(&mut lossless, "Звук без потерь (lossless)")
                     .changed()
                 {
                     self.send("lossless", json!({"enabled":lossless}));
@@ -673,7 +695,7 @@ impl App {
                 ui.separator();
                 let mut media = self.media.is_some();
                 if ui
-                    .checkbox(&mut media, "Мультимедийные клавиши клавиатуры")
+                    .checkbox(&mut media, "Мультимедийные клавиши")
                     .on_hover_text(
                         "Плей/пауза, следующий и предыдущий трек работают при свёрнутом окне",
                     )
@@ -755,7 +777,7 @@ impl App {
                         ui.selectable_value(&mut settings.language, "ru".into(), "Русский");
                         ui.selectable_value(&mut settings.language, "en".into(), "English");
                     });
-                ui.checkbox(&mut settings.links, "Ссылки на трек — кнопки в Discord");
+                ui.checkbox(&mut settings.links, "Ссылки на трек в Discord");
                 let after = serde_json::to_value(&settings).unwrap_or_default();
                 if before != after {
                     self.send("rpc_settings", after);
@@ -772,7 +794,6 @@ impl App {
                         self.bridge = None;
                     }
                 }
-                ui.small("Даёт локальным агентам доступ к плееру, очереди и любимым трекам.");
                 if let Some(bridge) = &self.bridge {
                     if ui.button("Скопировать конфигурацию MCP").clicked() {
                         match bridge.config() {
@@ -788,6 +809,28 @@ impl App {
                     ui.small("После перезапуска клиента скопируйте новую конфигурацию.");
                 }
             });
+            #[cfg(windows)]
+            card().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.heading("Обновления");
+                ui.label(format!("Версия {}", env!("CARGO_PKG_VERSION")));
+                let busy = matches!(
+                    self.updates,
+                    UpdateUi::Checking(..) | UpdateUi::Installing(..)
+                );
+                if ui
+                    .add_enabled(!busy, egui::Button::new("Проверить обновления"))
+                    .clicked()
+                {
+                    self.check_updates(ui.ctx(), true);
+                }
+                if matches!(self.updates, UpdateUi::Checking(..)) {
+                    ui.small("Проверка обновлений…");
+                }
+                if let UpdateUi::Status(message) = &self.updates {
+                    ui.small(message);
+                }
+            });
         });
     }
 
@@ -801,10 +844,10 @@ impl App {
         }
         ui.add_space(6.0);
         ui.horizontal(|ui| {
-            self.covers.draw(ui, playlist.cover_uri.as_deref(), 92.0);
+            self.covers.draw(ui, playlist.cover_uri.as_deref(), 96.0);
             ui.add_space(8.0);
             ui.vertical(|ui| {
-                ui.label(RichText::new(&playlist.title).size(26.0).strong());
+                ui.label(RichText::new(&playlist.title).size(28.0));
                 ui.label(
                     RichText::new(format!(
                         "{} • {} треков",
@@ -874,11 +917,11 @@ impl App {
             self.covers.draw(
                 ui,
                 info.as_ref().and_then(|info| info.cover_uri.as_deref()),
-                92.0,
+                96.0,
             );
             ui.add_space(8.0);
             ui.vertical(|ui| {
-                ui.label(RichText::new(&name).size(26.0).strong());
+                ui.label(RichText::new(&name).size(28.0));
                 let Some(info) = &info else {
                     return;
                 };
@@ -1135,12 +1178,6 @@ impl App {
         let pending = self.pending.iter().any(|(name, _)| name == "search");
         let query = self.query.trim();
         if query.is_empty() {
-            ui.add_space(20.0);
-            ui.label(RichText::new("Что хотите послушать?").size(21.0).strong());
-            ui.label(
-                RichText::new("Начните вводить название. Результаты появятся здесь.")
-                    .color(Color32::from_gray(164)),
-            );
             return;
         }
         if !pending {
@@ -1388,7 +1425,7 @@ impl App {
             self.open_track_view(ui.ctx(), track);
             ui.close();
         }
-        if ui.button("Моя волна по треку").clicked() {
+        if ui.button("Волна по треку").clicked() {
             self.send(
                 "wave_track",
                 json!({"track_id": track.id, "title": track.title}),
@@ -1406,11 +1443,17 @@ impl App {
                     ui.close();
                 }
             }
-            if playlists.is_empty() {
-                ui.label("Загружаем ваши плейлисты…");
+            if !playlists.iter().any(|playlist| playlist.id != "3") {
+                ui.label(
+                    if self.pending.iter().any(|(name, _)| name == "playlists") {
+                        "Загрузка плейлистов…"
+                    } else {
+                        "Нет личных плейлистов"
+                    },
+                );
             }
             ui.separator();
-            if ui.button("Создать новый плейлист…").clicked() {
+            if ui.button("Новый плейлист…").clicked() {
                 self.create_track = Some(track.clone());
                 self.playlist_title.clear();
                 self.playlist_dialog = true;
@@ -1461,7 +1504,7 @@ impl App {
     fn recommendation_cards(&mut self, ui: &mut egui::Ui, s: &Snapshot) {
         ui.add_space(16.0);
         ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("Хочу рекомендации").size(22.0).strong());
+            ui.label(RichText::new("Рекомендации").size(24.0));
             if ui
                 .add_enabled(
                     s.logged_in
@@ -1590,7 +1633,6 @@ impl App {
     fn track_detail(&mut self, ui: &mut egui::Ui, s: &Snapshot, track: &Track) {
         let area = ui.max_rect();
         let color = self.covers.palette(track.cover());
-        let phase = ui.input(|i| i.time) as f32 * 0.25;
         let mut mesh = egui::Mesh::default();
         let shade = |factor: f32| {
             Color32::from_rgb(
@@ -1600,17 +1642,16 @@ impl App {
             )
         };
         for (pos, factor) in [
-            (area.left_top(), 0.35 + 0.15 * phase.sin()),
-            (area.right_top(), 0.7 + 0.2 * phase.cos()),
+            (area.left_top(), 0.42),
+            (area.right_top(), 0.68),
             (area.right_bottom(), 0.3),
-            (area.left_bottom(), 0.65 - 0.2 * phase.cos()),
+            (area.left_bottom(), 0.5),
         ] {
             mesh.colored_vertex(pos, shade(factor));
         }
         mesh.add_triangle(0, 1, 2);
         mesh.add_triangle(0, 2, 3);
         ui.painter().add(egui::Shape::mesh(mesh));
-        ui.ctx().request_repaint_after(Duration::from_millis(66));
         ScrollArea::vertical().show(ui, |ui| {
             ui.add_space(12.0);
             ui.horizontal(|ui| {
@@ -1723,19 +1764,15 @@ impl App {
                     .char_limit(100)
                     .margin(egui::vec2(10.0, 8.0)),
             );
-            ui.add_space(8.0);
-            ui.label(
-                RichText::new("Личный плейлист. Выбранный трек добавится автоматически.")
-                    .size(12.0)
-                    .color(Color32::from_gray(155)),
-            );
-            ui.add_space(18.0);
-            ui.horizontal(|ui| {
+            ui.add_space(12.0);
+            ui.horizontal_wrapped(|ui| {
                 if ui
                     .add_enabled(
                         !busy && !self.playlist_title.trim().is_empty(),
                         primary(if busy {
                             "Создаём…"
+                        } else if self.create_track.is_some() {
+                            "Создать и добавить трек"
                         } else {
                             "Создать"
                         }),
@@ -2046,6 +2083,7 @@ impl App {
             .open(&mut open)
             .resizable(false)
             .collapsible(false)
+            .scroll([true, true])
             .anchor(
                 egui::Align2::CENTER_BOTTOM,
                 egui::vec2(0.0, if self.mini { -5.0 } else { -108.0 }),
@@ -2136,6 +2174,83 @@ impl eframe::App for App {
 
 impl App {
     pub(crate) fn update(&mut self, ctx: &Context) {
+        self.update_player(ctx);
+        #[cfg(windows)]
+        self.update_prompt(ctx);
+    }
+
+    #[cfg(windows)]
+    fn check_updates(&mut self, ctx: &Context, manual: bool) {
+        self.updates = UpdateUi::Checking(update_job(ctx, crate::updater::check), manual);
+    }
+
+    #[cfg(windows)]
+    fn update_prompt(&mut self, ctx: &Context) {
+        use std::sync::mpsc::TryRecvError;
+        match &self.updates {
+            UpdateUi::Checking(rx, manual) => match rx.try_recv() {
+                Ok(Ok(Some(update))) => self.updates = UpdateUi::Offer(update),
+                Ok(Ok(None)) if *manual => {
+                    self.updates = UpdateUi::Status("Установлена последняя версия".into());
+                }
+                Ok(Err(error)) if *manual => {
+                    self.updates =
+                        UpdateUi::Status(format!("Не удалось проверить обновления. {error}"));
+                }
+                Err(TryRecvError::Empty) => return,
+                _ => self.updates = UpdateUi::Idle,
+            },
+            UpdateUi::Installing(update, rx) => match rx.try_recv() {
+                Ok(Ok(())) => {
+                    self.updates = UpdateUi::Idle;
+                    self.quitting = true;
+                    ctx.send_viewport_cmd(ViewportCommand::Close);
+                    return;
+                }
+                Ok(Err(error)) => {
+                    self.updates = UpdateUi::Failed(update.clone(), error.to_string());
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.updates = UpdateUi::Failed(update.clone(), "Загрузка прервалась".into());
+                }
+                Err(TryRecvError::Empty) => {}
+            },
+            _ => {}
+        }
+        let (update, error, installing) = match &self.updates {
+            UpdateUi::Offer(update) => (update.clone(), None, false),
+            UpdateUi::Failed(update, error) => (update.clone(), Some(error.as_str()), false),
+            UpdateUi::Installing(update, _) => (update.clone(), None, true),
+            _ => return,
+        };
+        let mut apply = false;
+        let mut later = false;
+        let modal = egui::Modal::new(egui::Id::new("update-prompt")).show(ctx, |ui| {
+            ui.set_width((ctx.content_rect().width() - 32.0).clamp(200.0, 352.0));
+            ui.heading(format!("Обновление {}", update.version));
+            if installing {
+                ui.label("Загрузка и проверка обновления…");
+                return;
+            }
+            ui.label("Установить обновление и перезапустить плеер?");
+            if let Some(error) = error {
+                ui.label(format!("Не удалось установить обновление. {error}"));
+            }
+            ui.horizontal_wrapped(|ui| {
+                apply = ui.add(primary("Обновить")).clicked();
+                later = ui.button("Позже").clicked();
+            });
+        });
+        if apply {
+            let requested = update.clone();
+            let rx = update_job(ctx, move || crate::updater::install(&requested));
+            self.updates = UpdateUi::Installing(update, rx);
+        } else if !installing && (later || modal.should_close()) {
+            self.updates = UpdateUi::Status(format!("Доступна версия {}", update.version));
+        }
+    }
+
+    fn update_player(&mut self, ctx: &Context) {
         #[cfg(windows)]
         {
             if self.tray.is_some()
@@ -2271,7 +2386,15 @@ impl App {
                         if ui.button("Обновить").clicked() {
                             self.send("library", json!({}));
                         }
-                        ui.small(format!("Треков: {}", self.library.len()));
+                        if self.pending.iter().any(|(name, _)| name == "library")
+                            && self.library.is_empty()
+                        {
+                            ui.small("Загрузка любимых треков…");
+                        } else if self.library.is_empty() && self.status.is_empty() {
+                            ui.small("Пока нет любимых треков");
+                        } else {
+                            ui.small(format!("Треков: {}", self.library.len()));
+                        }
                         let library = std::mem::take(&mut self.library);
                         self.rows(ui, &library, None, false);
                         self.library = library;
@@ -2331,14 +2454,14 @@ impl App {
                                         );
                                     });
                                     if ui
-                                        .button("Открыть")
+                                        .button("Треки")
                                         .on_hover_text("Посмотреть треки плейлиста")
                                         .clicked()
                                     {
                                         self.open_playlist(playlist);
                                     }
                                     if ui
-                                        .button("Играть")
+                                        .button("Воспроизвести")
                                         .on_hover_text("Воспроизвести плейлист")
                                         .clicked()
                                     {
@@ -2361,7 +2484,7 @@ impl App {
                 Page::Queue => {
                     ui.heading("Очередь");
                     if snapshot.queue.is_empty() {
-                        ui.label("Добавьте трек из поиска");
+                        ui.label("Очередь пуста. Добавьте трек из поиска");
                     }
                     self.rows(ui, &snapshot.queue, snapshot.index, true);
                 }
@@ -2384,16 +2507,28 @@ impl App {
         } else {
             ""
         };
+        if hint.is_empty() {
+            return;
+        }
         ui.add_sized(
             [ui.available_width(), 16.0],
-            egui::Label::new(
-                RichText::new(hint)
-                    .size(11.0)
-                    .color(Color32::from_gray(163)),
-            )
-            .truncate(),
+            egui::Label::new(RichText::new(hint).size(11.0).color(MUTED)).truncate(),
         );
     }
+}
+
+#[cfg(windows)]
+fn update_job<T: Send + 'static>(
+    ctx: &Context,
+    job: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+) -> Receiver<anyhow::Result<T>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let ctx = ctx.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(job());
+        ctx.request_repaint();
+    });
+    rx
 }
 
 fn shortcut_command(
@@ -2557,7 +2692,7 @@ fn nav_item(ui: &mut egui::Ui, label: &str, icon: Option<Page>, active: bool) ->
 fn primary(label: &str) -> egui::Button<'_> {
     egui::Button::new(RichText::new(label).color(Color32::from_gray(22)).strong())
         .fill(YELLOW)
-        .corner_radius(20)
+        .corner_radius(8)
 }
 
 fn icon_button(symbol: &str, active: bool) -> egui::Button<'_> {
@@ -2568,7 +2703,7 @@ fn icon_button(symbol: &str, active: bool) -> egui::Button<'_> {
     };
     let mut button = egui::Button::new(RichText::new(symbol).size(15.0).color(color))
         .min_size(egui::vec2(32.0, 32.0))
-        .corner_radius(22);
+        .corner_radius(8);
     if active {
         button = button.fill(YELLOW);
     }
@@ -2820,9 +2955,10 @@ fn draw_wave(ui: &egui::Ui, rect: egui::Rect, playing: bool) {
 
 fn card() -> Frame {
     Frame::new()
-        .fill(Color32::from_rgb(28, 28, 33))
-        .corner_radius(14)
-        .inner_margin(Margin::same(17))
+        .fill(SURFACE)
+        .stroke(egui::Stroke::new(1.0_f32, Color32::from_gray(42)))
+        .corner_radius(12)
+        .inner_margin(Margin::same(16))
 }
 
 fn time(seconds: f64) -> String {

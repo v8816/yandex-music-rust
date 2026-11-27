@@ -1,6 +1,10 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 fn main() -> anyhow::Result<()> {
+    #[cfg(windows)]
+    if yandex_music_rust::updater::handle_startup()? {
+        return Ok(());
+    }
     if std::env::args().nth(1).as_deref() == Some("--mcp") {
         let result = (|| -> anyhow::Result<()> {
             let port = std::env::args()
