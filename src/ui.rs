@@ -1318,7 +1318,7 @@ impl App {
         } else {
             "Обычная волна"
         });
-        let rows = |ui: &mut egui::Ui, this: &mut Self| {
+        let reset = |ui: &mut egui::Ui, this: &mut Self| {
             ui.add_enabled_ui(!this.wave_busy(), |ui| {
                 if mood_row(
                     ui,
@@ -1330,9 +1330,17 @@ impl App {
                         ui.close();
                     }
                 }
+            });
+        };
+        let rows = |ui: &mut egui::Ui, this: &mut Self| {
+            ui.add_enabled_ui(!this.wave_busy(), |ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
                 for (group, moods) in WAVE_MOODS {
-                    ui.add_space(8.0);
-                    ui.label(RichText::new(*group).size(12.0).color(MUTED));
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(8.0);
+                        ui.label(RichText::new(*group).size(12.0).color(MUTED));
+                    });
                     for &(id, name) in *moods {
                         if mood_row(ui, name, selected == Some(id)) {
                             this.choose_mood(Some(id), s.logged_in);
@@ -1347,11 +1355,16 @@ impl App {
         if compact {
             egui::ComboBox::from_id_salt("wave-moods-compact")
                 .selected_text(label)
-                .height(316.0)
-                .show_ui(ui, |ui| rows(ui, self));
+                .height(320.0)
+                .show_ui(ui, |ui| {
+                    reset(ui, self);
+                    rows(ui, self);
+                });
         } else {
-            ui.label(RichText::new("Настроения").size(18.0));
+            ui.label(RichText::new("Настроения").size(20.0));
             ui.add_space(4.0);
+            reset(ui, self);
+            ui.separator();
             ScrollArea::vertical()
                 .id_salt("wave-moods-list")
                 .auto_shrink([false, false])
@@ -1373,7 +1386,7 @@ impl App {
             self.home(ui, s);
             return;
         }
-        let height = (ui.available_height() * 0.8).clamp(320.0, 600.0);
+        let height = Self::wave_height(ui, s).max(320.0);
         let menu_width = (width * 0.26).clamp(164.0, 224.0);
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
@@ -1382,11 +1395,11 @@ impl App {
                 Layout::top_down(Align::Min),
                 |ui| {
                     Frame::new()
-                        .fill(SURFACE)
-                        .inner_margin(Margin::same(12))
+                        .fill(Color32::from_rgb(22, 22, 25))
+                        .inner_margin(Margin::same(16))
                         .show(ui, |ui| {
-                            ui.set_width(menu_width - 24.0);
-                            ui.set_height(height - 24.0);
+                            ui.set_width(menu_width - 32.0);
+                            ui.set_height(height - 32.0);
                             self.wave_mood_list(ui, s, false);
                         });
                 },
@@ -1394,20 +1407,31 @@ impl App {
             ui.allocate_ui_with_layout(
                 egui::vec2(width - menu_width, height),
                 Layout::top_down(Align::Min),
-                |ui| self.home(ui, s),
+                |ui| self.home_with_height(ui, s, height),
             );
         });
     }
 
     fn home(&mut self, ui: &mut egui::Ui, s: &Snapshot) {
+        self.home_with_height(ui, s, Self::wave_height(ui, s));
+    }
+
+    fn wave_height(ui: &egui::Ui, s: &Snapshot) -> f32 {
+        let min = if s.wave && s.track.is_some() {
+            320.0
+        } else {
+            240.0
+        };
+        (ui.available_height() * 0.8).clamp(min, 600.0)
+    }
+
+    fn home_with_height(&mut self, ui: &mut egui::Ui, s: &Snapshot, height: f32) {
         let wave_busy = self.wave_busy();
         let active = s.wave && s.track.is_some();
         let track_wave = s.wave
             && s.wave_station
                 .as_ref()
                 .is_some_and(|station| station.seed_track.is_some());
-        let minimum_height = if active { 320.0 } else { 240.0 };
-        let height = (ui.available_height() * 0.80).clamp(minimum_height, 600.0);
         let (area, _) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), height),
             egui::Sense::hover(),
@@ -2874,19 +2898,34 @@ fn wave_mood_name(id: Option<&str>) -> Option<&'static str> {
 }
 
 fn mood_row(ui: &mut egui::Ui, label: &str, selected: bool) -> bool {
-    ui.add_sized(
-        [ui.available_width(), 32.0],
-        egui::Button::new(RichText::new(label).color(if selected {
-            YELLOW
-        } else {
-            Color32::from_gray(219)
-        }))
-        .selected(selected)
-        .frame_when_inactive(false)
-        .right_text("")
-        .truncate(),
-    )
-    .clicked()
+    let response = ui
+        .scope(|ui| {
+            ui.spacing_mut().button_padding.x = 8.0;
+            ui.visuals_mut().selection.bg_fill = Color32::from_rgb(43, 42, 41);
+            ui.visuals_mut().selection.stroke = egui::Stroke::NONE;
+            ui.add_sized(
+                [ui.available_width(), 32.0],
+                egui::Button::new(RichText::new(label).size(14.0).color(if selected {
+                    YELLOW
+                } else {
+                    Color32::from_gray(219)
+                }))
+                .selected(selected)
+                .frame_when_inactive(false)
+                .right_text("")
+                .truncate(),
+            )
+        })
+        .inner;
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            response.rect.shrink(1.0),
+            8,
+            egui::Stroke::new(1.0_f32, MUTED),
+            egui::StrokeKind::Inside,
+        );
+    }
+    response.clicked()
 }
 
 fn primary(label: &str) -> egui::Button<'_> {
