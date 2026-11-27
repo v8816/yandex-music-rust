@@ -16,4 +16,6 @@ pub mod stream;
 pub mod ui;
 #[cfg(windows)]
 pub mod updater;
+mod wave_arc;
+mod wave_art;
 mod worker;
