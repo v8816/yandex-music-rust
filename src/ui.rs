@@ -1307,7 +1307,7 @@ impl App {
         }
     }
 
-    fn wave_mood_list(&mut self, ui: &mut egui::Ui, s: &Snapshot, compact: bool) {
+    fn wave_mood_list(&mut self, ui: &mut egui::Ui, s: &Snapshot) {
         let selected = s.wave_mood.as_deref();
         let track_wave = s
             .wave_station
@@ -1326,9 +1326,7 @@ impl App {
                     s.wave && selected.is_none() && !track_wave,
                 ) {
                     this.choose_mood(None, s.logged_in);
-                    if compact {
-                        ui.close();
-                    }
+                    ui.close();
                 }
             });
         };
@@ -1344,32 +1342,19 @@ impl App {
                     for &(id, name) in *moods {
                         if mood_row(ui, name, selected == Some(id)) {
                             this.choose_mood(Some(id), s.logged_in);
-                            if compact {
-                                ui.close();
-                            }
+                            ui.close();
                         }
                     }
                 }
             });
         };
-        if compact {
-            egui::ComboBox::from_id_salt("wave-moods-compact")
-                .selected_text(label)
-                .height(320.0)
-                .show_ui(ui, |ui| {
-                    reset(ui, self);
-                    rows(ui, self);
-                });
-        } else {
-            ui.label(RichText::new("Настроения").size(20.0));
-            ui.add_space(4.0);
-            reset(ui, self);
-            ui.separator();
-            ScrollArea::vertical()
-                .id_salt("wave-moods-list")
-                .auto_shrink([false, false])
-                .show(ui, |ui| rows(ui, self));
-        }
+        egui::ComboBox::from_id_salt("wave-moods-compact")
+            .selected_text(label)
+            .height(320.0)
+            .show_ui(ui, |ui| {
+                reset(ui, self);
+                rows(ui, self);
+            });
     }
 
     fn wave_home(&mut self, ui: &mut egui::Ui, s: &Snapshot) {
@@ -1380,40 +1365,76 @@ impl App {
                 .show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.label("Настроения");
-                        self.wave_mood_list(ui, s, true);
+                        let (art, _) =
+                            ui.allocate_exact_size(egui::Vec2::splat(24.0), egui::Sense::hover());
+                        crate::wave_art::paint(ui.painter(), art, s.wave_mood.as_deref(), 1.0);
+                        self.wave_mood_list(ui, s);
                     });
                 });
             self.home(ui, s);
             return;
         }
         let height = Self::wave_height(ui, s).max(320.0);
-        let menu_width = (width * 0.26).clamp(164.0, 224.0);
+        let menu_width = (width * 0.32).clamp(232.0, 304.0);
+        let scene = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(width, height));
+        if ui.is_rect_visible(scene) {
+            draw_wave(ui, scene, s.wave && s.playing, menu_width * 0.32);
+        }
+        static ITEMS: std::sync::LazyLock<Vec<(Option<&str>, &str)>> =
+            std::sync::LazyLock::new(|| {
+                std::iter::once((None, "Обычная волна"))
+                    .chain(
+                        WAVE_MOODS.iter().flat_map(|(_, moods)| {
+                            moods.iter().map(|&(id, title)| (Some(id), title))
+                        }),
+                    )
+                    .collect()
+            });
+        let selected = if !s.wave {
+            None
+        } else if let Some(id) = s.wave_mood.as_deref() {
+            ITEMS.iter().position(|item| item.0 == Some(id))
+        } else if s
+            .wave_station
+            .as_ref()
+            .is_some_and(|station| station.seed_track.is_some())
+        {
+            None
+        } else {
+            Some(0)
+        };
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
             ui.allocate_ui_with_layout(
                 egui::vec2(menu_width, height),
                 Layout::top_down(Align::Min),
                 |ui| {
-                    Frame::new()
-                        .fill(Color32::from_rgb(22, 22, 25))
-                        .inner_margin(Margin::same(16))
-                        .show(ui, |ui| {
-                            ui.set_width(menu_width - 32.0);
-                            ui.set_height(height - 32.0);
-                            self.wave_mood_list(ui, s, false);
-                        });
+                    let (area, _) = ui
+                        .allocate_exact_size(egui::vec2(menu_width, height), egui::Sense::hover());
+                    if ui.is_rect_visible(area)
+                        && let Some(index) = crate::wave_arc::show(
+                            ui,
+                            area.shrink2(egui::vec2(0.0, 8.0)),
+                            &ITEMS,
+                            selected,
+                            !self.wave_busy(),
+                        )
+                        && let Some(&(id, _)) = ITEMS.get(index)
+                    {
+                        self.choose_mood(id, s.logged_in);
+                    }
                 },
             );
             ui.allocate_ui_with_layout(
                 egui::vec2(width - menu_width, height),
                 Layout::top_down(Align::Min),
-                |ui| self.home_with_height(ui, s, height),
+                |ui| self.home_with_height(ui, s, height, false),
             );
         });
     }
 
     fn home(&mut self, ui: &mut egui::Ui, s: &Snapshot) {
-        self.home_with_height(ui, s, Self::wave_height(ui, s));
+        self.home_with_height(ui, s, Self::wave_height(ui, s), true);
     }
 
     fn wave_height(ui: &egui::Ui, s: &Snapshot) -> f32 {
@@ -1425,7 +1446,13 @@ impl App {
         (ui.available_height() * 0.8).clamp(min, 600.0)
     }
 
-    fn home_with_height(&mut self, ui: &mut egui::Ui, s: &Snapshot, height: f32) {
+    fn home_with_height(
+        &mut self,
+        ui: &mut egui::Ui,
+        s: &Snapshot,
+        height: f32,
+        paint_background: bool,
+    ) {
         let wave_busy = self.wave_busy();
         let active = s.wave && s.track.is_some();
         let track_wave = s.wave
@@ -1436,8 +1463,8 @@ impl App {
             egui::vec2(ui.available_width(), height),
             egui::Sense::hover(),
         );
-        if ui.is_rect_visible(area) {
-            draw_wave(ui, area, s.wave && s.playing);
+        if paint_background && ui.is_rect_visible(area) {
+            draw_wave(ui, area, s.wave && s.playing, 0.0);
         }
         let heading = if active {
             s.track.as_ref().unwrap().artist()
@@ -3125,7 +3152,7 @@ fn paint_control(painter: &egui::Painter, center: egui::Pos2, color: Color32, ic
     }
 }
 
-fn draw_wave(ui: &egui::Ui, rect: egui::Rect, playing: bool) {
+fn draw_wave(ui: &egui::Ui, rect: egui::Rect, playing: bool, player_offset: f32) {
     let painter = ui.painter().with_clip_rect(rect);
     let t = if playing {
         ui.input(|i| i.time) as f32 * 0.22
@@ -3148,7 +3175,7 @@ fn draw_wave(ui: &egui::Ui, rect: egui::Rect, playing: bool) {
     ] {
         let center = rect.center()
             + egui::vec2(
-                (offset.x + 0.035 * t.sin()) * rect.width(),
+                (offset.x + 0.035 * t.sin()) * rect.width() + player_offset,
                 (offset.y + 0.035 * t.cos()) * rect.height(),
             );
         let radius = egui::vec2(rect.width() * scale, rect.height() * scale * 1.3);
@@ -3536,11 +3563,12 @@ mod card_layout_tests {
                 text_shapes(&shape.shape, &mut labels);
             }
             let rect = |label: &str| labels.iter().find(|(text, _, _)| text == label).unwrap().2;
-            let picker = rect("Настроения");
             let hero = rect("Моя волна");
             if width > 580.0 {
+                let picker = rect("Обычная волна");
                 assert!(picker.right() < hero.left());
             } else {
+                let picker = rect("Настроения");
                 assert!(picker.bottom() < hero.top());
                 assert!(!labels.iter().any(|(text, _, _)| text == "Незнакомое"));
             }
