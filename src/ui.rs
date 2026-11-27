@@ -24,6 +24,73 @@ const YELLOW: Color32 = Color32::from_rgb(255, 220, 60);
 const MIN_VOLUME_DB: f32 = -60.0;
 const SURFACE: Color32 = Color32::from_rgb(27, 27, 30);
 const MUTED: Color32 = Color32::from_gray(167);
+type WaveMoodGroup = (&'static str, &'static [(&'static str, &'static str)]);
+const WAVE_MOODS: &[WaveMoodGroup] = &[
+    (
+        "Подбор",
+        &[
+            ("settingDiversity:discover", "Незнакомое"),
+            ("settingDiversity:favorite", "Знакомое"),
+            ("settingDiversity:popular", "Популярное"),
+            ("settingLanguage:russian", "Только на русском"),
+            ("settingLanguage:not-russian", "На других языках"),
+            ("settingLanguage:without-words", "Без слов"),
+        ],
+    ),
+    (
+        "Настроение",
+        &[
+            ("mood:calm", "Спокойствие"),
+            ("mood:happy", "Хорошее настроение"),
+            ("mood:sad", "Погрустить"),
+            ("mood:energetic", "Больше энергии"),
+            ("mood:dream", "Помечтать"),
+            ("mood:dark", "Мрачное"),
+            ("mood:epic", "Эпическое"),
+            ("mood:relaxed", "Расслабиться"),
+        ],
+    ),
+    (
+        "Занятие",
+        &[
+            ("activity:study-background", "Для учёбы"),
+            ("activity:work-background", "Для работы"),
+            ("activity:wake-up", "Проснуться"),
+            ("activity:run", "На пробежку"),
+            ("activity:workout", "На тренировку"),
+            ("activity:driving", "За рулём"),
+            ("activity:road-trip", "В дальнюю дорогу"),
+            ("activity:party", "На вечеринку"),
+            ("activity:fall-asleep", "Перед сном"),
+        ],
+    ),
+    (
+        "Жанр",
+        &[
+            ("genre:alternative", "Альтернатива"),
+            ("micro-genre:alternative-pop-rock", "Альт-поп-рок"),
+            ("micro-genre:alternative-indie-rock", "Инди-рок"),
+            ("genre:indie", "Инди"),
+            ("genre:phonkgenre", "Фонк"),
+            ("genre:ambientgenre", "Эмбиент"),
+            ("genre:postpunk", "Постпанк"),
+            ("genre:jazz", "Джаз"),
+            ("genre:electronics", "Электроника"),
+            ("genre:allrock", "Рок"),
+            ("genre:classical", "Классика"),
+            ("genre:rap", "Рэп"),
+            ("genre:soundtrack", "Саундтреки"),
+        ],
+    ),
+    (
+        "Десятилетие",
+        &[
+            ("epoch:eighties", "80-е"),
+            ("epoch:nineties", "90-е"),
+            ("epoch:zeroes", "2000-е"),
+        ],
+    ),
+];
 
 #[cfg(windows)]
 #[derive(Default)]
@@ -294,6 +361,7 @@ impl App {
                     | "play_track"
                     | "play_results"
                     | "wave_start"
+                    | "wave_mood"
                     | "wave_track"
                     | "wave_shake"
                     | "wave_undo"
@@ -1220,20 +1288,150 @@ impl App {
         }
     }
 
-    fn home(&mut self, ui: &mut egui::Ui, s: &Snapshot) {
-        let wave_busy = self.pending.iter().any(|(name, _)| {
+    fn wave_busy(&self) -> bool {
+        self.pending.iter().any(|(name, _)| {
             matches!(
                 name.as_str(),
-                "wave_start" | "wave_track" | "wave_shake" | "wave_undo"
+                "wave_start" | "wave_mood" | "wave_track" | "wave_shake" | "wave_undo"
             )
+        })
+    }
+
+    fn choose_mood(&mut self, mood: Option<&str>, signed_in: bool) {
+        if !signed_in {
+            self.navigate(Page::Settings, false);
+        } else if let Some(mood) = mood {
+            self.send("wave_mood", json!({"mood":mood}));
+        } else {
+            self.send("wave_start", json!({}));
+        }
+    }
+
+    fn wave_mood_list(&mut self, ui: &mut egui::Ui, s: &Snapshot, compact: bool) {
+        let selected = s.wave_mood.as_deref();
+        let track_wave = s
+            .wave_station
+            .as_ref()
+            .is_some_and(|station| station.seed_track.is_some());
+        let label = wave_mood_name(selected).unwrap_or(if track_wave {
+            "Волна по треку"
+        } else {
+            "Обычная волна"
         });
+        let reset = |ui: &mut egui::Ui, this: &mut Self| {
+            ui.add_enabled_ui(!this.wave_busy(), |ui| {
+                if mood_row(
+                    ui,
+                    "Обычная волна",
+                    s.wave && selected.is_none() && !track_wave,
+                ) {
+                    this.choose_mood(None, s.logged_in);
+                    if compact {
+                        ui.close();
+                    }
+                }
+            });
+        };
+        let rows = |ui: &mut egui::Ui, this: &mut Self| {
+            ui.add_enabled_ui(!this.wave_busy(), |ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                for (group, moods) in WAVE_MOODS {
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(8.0);
+                        ui.label(RichText::new(*group).size(12.0).color(MUTED));
+                    });
+                    for &(id, name) in *moods {
+                        if mood_row(ui, name, selected == Some(id)) {
+                            this.choose_mood(Some(id), s.logged_in);
+                            if compact {
+                                ui.close();
+                            }
+                        }
+                    }
+                }
+            });
+        };
+        if compact {
+            egui::ComboBox::from_id_salt("wave-moods-compact")
+                .selected_text(label)
+                .height(320.0)
+                .show_ui(ui, |ui| {
+                    reset(ui, self);
+                    rows(ui, self);
+                });
+        } else {
+            ui.label(RichText::new("Настроения").size(20.0));
+            ui.add_space(4.0);
+            reset(ui, self);
+            ui.separator();
+            ScrollArea::vertical()
+                .id_salt("wave-moods-list")
+                .auto_shrink([false, false])
+                .show(ui, |ui| rows(ui, self));
+        }
+    }
+
+    fn wave_home(&mut self, ui: &mut egui::Ui, s: &Snapshot) {
+        let width = ui.available_width();
+        if width < 580.0 {
+            Frame::new()
+                .inner_margin(Margin::symmetric(16, 8))
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Настроения");
+                        self.wave_mood_list(ui, s, true);
+                    });
+                });
+            self.home(ui, s);
+            return;
+        }
+        let height = Self::wave_height(ui, s).max(320.0);
+        let menu_width = (width * 0.26).clamp(164.0, 224.0);
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            ui.allocate_ui_with_layout(
+                egui::vec2(menu_width, height),
+                Layout::top_down(Align::Min),
+                |ui| {
+                    Frame::new()
+                        .fill(Color32::from_rgb(22, 22, 25))
+                        .inner_margin(Margin::same(16))
+                        .show(ui, |ui| {
+                            ui.set_width(menu_width - 32.0);
+                            ui.set_height(height - 32.0);
+                            self.wave_mood_list(ui, s, false);
+                        });
+                },
+            );
+            ui.allocate_ui_with_layout(
+                egui::vec2(width - menu_width, height),
+                Layout::top_down(Align::Min),
+                |ui| self.home_with_height(ui, s, height),
+            );
+        });
+    }
+
+    fn home(&mut self, ui: &mut egui::Ui, s: &Snapshot) {
+        self.home_with_height(ui, s, Self::wave_height(ui, s));
+    }
+
+    fn wave_height(ui: &egui::Ui, s: &Snapshot) -> f32 {
+        let min = if s.wave && s.track.is_some() {
+            320.0
+        } else {
+            240.0
+        };
+        (ui.available_height() * 0.8).clamp(min, 600.0)
+    }
+
+    fn home_with_height(&mut self, ui: &mut egui::Ui, s: &Snapshot, height: f32) {
+        let wave_busy = self.wave_busy();
         let active = s.wave && s.track.is_some();
         let track_wave = s.wave
             && s.wave_station
                 .as_ref()
                 .is_some_and(|station| station.seed_track.is_some());
-        let minimum_height = if active { 320.0 } else { 240.0 };
-        let height = (ui.available_height() * 0.80).clamp(minimum_height, 600.0);
         let (area, _) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), height),
             egui::Sense::hover(),
@@ -1276,7 +1474,7 @@ impl App {
                 if track_wave {
                     "Волна по треку"
                 } else {
-                    "Моя волна"
+                    wave_mood_name(s.wave_mood.as_deref()).unwrap_or("Моя волна")
                 },
                 egui::FontId::proportional(13.0),
                 YELLOW,
@@ -1317,6 +1515,8 @@ impl App {
                     {
                         if !s.logged_in {
                             self.navigate(Page::Settings, false);
+                        } else if s.wave && !s.error.is_empty() && s.wave_mood.is_some() {
+                            self.choose_mood(s.wave_mood.as_deref(), s.logged_in);
                         } else {
                             self.send(
                                 if !s.wave || !s.error.is_empty() {
@@ -2372,7 +2572,7 @@ impl App {
                     ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            self.home(ui, &snapshot);
+                            self.wave_home(ui, &snapshot);
                             Frame::new()
                                 .inner_margin(Margin::symmetric(24, 12))
                                 .show(ui, |ui| self.recommendation_cards(ui, &snapshot));
@@ -2685,6 +2885,45 @@ fn nav_item(ui: &mut egui::Ui, label: &str, icon: Option<Page>, active: bool) ->
                 }
             }
         }
+    }
+    response.clicked()
+}
+
+fn wave_mood_name(id: Option<&str>) -> Option<&'static str> {
+    let id = id?;
+    WAVE_MOODS
+        .iter()
+        .flat_map(|(_, moods)| *moods)
+        .find_map(|&(key, label)| (key == id).then_some(label))
+}
+
+fn mood_row(ui: &mut egui::Ui, label: &str, selected: bool) -> bool {
+    let response = ui
+        .scope(|ui| {
+            ui.spacing_mut().button_padding.x = 8.0;
+            ui.visuals_mut().selection.bg_fill = Color32::from_rgb(43, 42, 41);
+            ui.visuals_mut().selection.stroke = egui::Stroke::NONE;
+            ui.add_sized(
+                [ui.available_width(), 32.0],
+                egui::Button::new(RichText::new(label).size(14.0).color(if selected {
+                    YELLOW
+                } else {
+                    Color32::from_gray(219)
+                }))
+                .selected(selected)
+                .frame_when_inactive(false)
+                .right_text("")
+                .truncate(),
+            )
+        })
+        .inner;
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            response.rect.shrink(1.0),
+            8,
+            egui::Stroke::new(1.0_f32, MUTED),
+            egui::StrokeKind::Inside,
+        );
     }
     response.clicked()
 }
@@ -3261,6 +3500,53 @@ mod card_layout_tests {
             _ => {}
         }
     }
+    #[test]
+    fn mood_catalog_matches_the_player_allowlist() {
+        let mut visible: Vec<_> = WAVE_MOODS
+            .iter()
+            .flat_map(|(_, moods)| moods.iter().map(|(id, _)| *id))
+            .collect();
+        let mut accepted = crate::preferences::WAVE_MOOD_IDS.to_vec();
+        visible.sort_unstable();
+        accepted.sort_unstable();
+        assert_eq!(visible, accepted);
+    }
+
+    #[test]
+    fn mood_picker_sits_left_of_wave_and_collapses_at_narrow_widths() {
+        for width in [840.0, 360.0] {
+            let ctx = Context::default();
+            let mut app = App::new_internal(&ctx, false, None);
+            let frame = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 520.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        app.wave_home(ui, &Snapshot::default());
+                    });
+                },
+            );
+            let mut labels = Vec::new();
+            for shape in frame.shapes {
+                text_shapes(&shape.shape, &mut labels);
+            }
+            let rect = |label: &str| labels.iter().find(|(text, _, _)| text == label).unwrap().2;
+            let picker = rect("Настроения");
+            let hero = rect("Моя волна");
+            if width > 580.0 {
+                assert!(picker.right() < hero.left());
+            } else {
+                assert!(picker.bottom() < hero.top());
+                assert!(!labels.iter().any(|(text, _, _)| text == "Незнакомое"));
+            }
+        }
+    }
+
     #[test]
     fn track_wave_can_return_to_personal_wave_independently_of_shake_undo() {
         let ctx = Context::default();
